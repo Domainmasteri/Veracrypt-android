@@ -35,6 +35,7 @@
 #include <cstring>
 #include <cstdint>
 #include <unistd.h>
+#include <fcntl.h>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -401,6 +402,29 @@ static void aes256_xts_decrypt(const uint8_t key1[32], const uint8_t key2[32],
     }
 }
 
+static void aes256_xts_encrypt(const uint8_t key1[32], const uint8_t key2[32],
+                               uint64_t unit_no,
+                               const uint8_t *pt, uint8_t *ct, size_t len) {
+    AES256_KS ks1, ks2;
+    aes256_expand(key1, ks1);
+    aes256_expand(key2, ks2);
+
+    uint8_t tweak_in[16] = {};
+    for (int i = 0; i < 8; i++) tweak_in[i] = (unit_no >> (8 * i)) & 0xff;
+    uint8_t T[16];
+    aes256_encrypt_block(ks2, tweak_in, T);
+
+    for (size_t pos = 0; pos + 16 <= len; pos += 16) {
+        uint8_t tmp[16];
+        for (int i = 0; i < 16; i++) tmp[i] = pt[pos + i] ^ T[i];
+        aes256_encrypt_block(ks1, tmp, tmp);
+        for (int i = 0; i < 16; i++) ct[pos + i] = tmp[i] ^ T[i];
+        uint8_t carry = T[15] >> 7;
+        for (int i = 15; i > 0; i--) T[i] = (uint8_t)((T[i] << 1) | (T[i - 1] >> 7));
+        T[0] = (uint8_t)((T[0] << 1) ^ (carry ? 0x87u : 0u));
+    }
+}
+
 // ============================================================
 // CRC-32 (IEEE 802.3 / zlib polynomial 0xEDB88320)
 // ============================================================
@@ -455,6 +479,26 @@ static inline uint64_t le64r(const uint8_t* p) {
            ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
            ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
 }
+static inline void le16w(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+static inline void le32w(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+static inline void le64w(uint8_t* p, uint64_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+    p[4] = (uint8_t)((v >> 32) & 0xFFu);
+    p[5] = (uint8_t)((v >> 40) & 0xFFu);
+    p[6] = (uint8_t)((v >> 48) & 0xFFu);
+    p[7] = (uint8_t)((v >> 56) & 0xFFu);
+}
 
 // ============================================================
 // Sector reader
@@ -489,6 +533,31 @@ static bool vc_read_sector(int fd, uint64_t sectorNo, uint8_t outBuf[VC_MAX_SECT
     return true;
 }
 
+static bool vc_write_sector(int fd, uint64_t sectorNo, const uint8_t inBuf[VC_MAX_SECTOR_SIZE]) {
+    if (!g_session.valid) return false;
+
+    uint32_t sz = g_session.sectorSize;
+    if (sz == 0 || sz > VC_MAX_SECTOR_SIZE) {
+        LOGE("vc_write_sector: unexpected sector size %u", sz);
+        return false;
+    }
+
+    off64_t fileOff = (off64_t)(g_session.dataOffset + sectorNo * (uint64_t)sz);
+    if (lseek64(fd, fileOff, SEEK_SET) < 0) {
+        LOGE("vc_write_sector: lseek failed for sector %llu", (unsigned long long)sectorNo);
+        return false;
+    }
+
+    uint8_t enc[VC_MAX_SECTOR_SIZE] = {};
+    aes256_xts_encrypt(g_session.masterKey1, g_session.masterKey2, sectorNo, inBuf, enc, sz);
+    ssize_t n = write(fd, enc, sz);
+    if (n != (ssize_t)sz) {
+        LOGE("vc_write_sector: write %zd of %u bytes at sector %llu", n, sz, (unsigned long long)sectorNo);
+        return false;
+    }
+    return true;
+}
+
 // ============================================================
 // FAT32 parser (read-only)
 // ============================================================
@@ -500,6 +569,8 @@ struct DirEntry {
     uint16_t    modDate;      // FAT date encoding
     uint16_t    modTime;      // FAT time encoding
     uint32_t    firstCluster; // starting FAT cluster of this entry's data
+    uint64_t    recordSector; // logical sector where primary entry starts
+    uint32_t    recordOffset; // byte offset within recordSector (0..sectorSize-32)
 };
 
 // Convert a UCS-2LE code point to UTF-8; returns number of bytes written (1-3).
@@ -562,6 +633,8 @@ struct Fat32Info {
     uint32_t firstFATSector;   // logical sector index of the first FAT
     uint32_t firstDataSector;  // logical sector index of cluster 2
     uint32_t rootCluster;
+    uint32_t sectorsPerFat;
+    uint8_t  numFATs;
 };
 
 // Read and parse the FAT32 BIOS Parameter Block (sector 0 of the data area).
@@ -590,6 +663,8 @@ static bool fat32_read_bpb(int fd, Fat32Info* fi) {
     fi->firstFATSector    = rsc;
     fi->firstDataSector   = rsc + (uint32_t)numFATs * spf32;
     fi->rootCluster       = rootCls;
+    fi->sectorsPerFat     = spf32;
+    fi->numFATs           = numFATs;
 
     LOGI("fat32_read_bpb: bps=%u spc=%u firstFAT=%u firstData=%u rootClus=%u",
          bps, spc, fi->firstFATSector, fi->firstDataSector, rootCls);
@@ -712,7 +787,7 @@ static std::vector<DirEntry> fat32_list_cluster(int fd, const Fat32Info& fi,
                 uint16_t mtime        = le16r(ent + 22);
                 uint32_t firstCluster = ((uint32_t)le16r(ent + 20) << 16) | (uint32_t)le16r(ent + 26);
 
-                results.push_back({name, isDir, fsize, mdate, mtime, firstCluster});
+                results.push_back({name, isDir, fsize, mdate, mtime, firstCluster, firstSec + s, e * 32u});
             }
         }
 
@@ -737,7 +812,7 @@ static uint32_t fat32_find_dir(const Fat32Info& fi, const char* path) {
 // Filesystem detection
 // ============================================================
 
-enum FsType { FS_UNKNOWN, FS_FAT32, FS_EXFAT };
+enum FsType { FS_UNKNOWN, FS_FAT32, FS_EXFAT, FS_NTFS };
 
 static FsType detect_filesystem(int fd) {
     uint8_t sec[VC_MAX_SECTOR_SIZE];
@@ -745,6 +820,7 @@ static FsType detect_filesystem(int fd) {
 
     // exFAT: OEM name at bytes 3-10 is "EXFAT   " (with 3 trailing spaces)
     if (memcmp(sec + 3, "EXFAT   ", 8) == 0) return FS_EXFAT;
+    if (memcmp(sec + 3, "NTFS    ", 8) == 0) return FS_NTFS;
 
     // FAT32: BPB_BytsPerSec (offset 11) != 0 and BPB_FATSz32 (offset 36) != 0
     uint16_t bps   = le16r(sec + 11);
@@ -778,7 +854,9 @@ static FsType detect_filesystem(int fd) {
 
 struct ExFatInfo {
     uint32_t fatOffset;           // first FAT sector (from start of data area)
+    uint32_t fatLength;           // FAT length in sectors
     uint32_t clusterHeapOffset;   // first cluster-heap sector
+    uint32_t clusterCount;        // total cluster count
     uint32_t rootCluster;         // first cluster of root directory
     uint8_t  bytesPerSectorShift;
     uint8_t  sectorsPerClusterShift;
@@ -798,7 +876,9 @@ static bool exfat_read_bpb(int fd, ExFatInfo* ei) {
     }
 
     uint32_t fatOffset         = le32r(sec + 80);
+    uint32_t fatLength         = le32r(sec + 84);
     uint32_t clusterHeapOffset = le32r(sec + 88);
+    uint32_t clusterCount      = le32r(sec + 92);
     uint32_t rootCluster       = le32r(sec + 96);
     uint8_t  bpss              = sec[108]; // BytesPerSectorShift
     uint8_t  spcs              = sec[109]; // SectorsPerClusterShift
@@ -809,7 +889,9 @@ static bool exfat_read_bpb(int fd, ExFatInfo* ei) {
     }
 
     ei->fatOffset              = fatOffset;
+    ei->fatLength              = fatLength;
     ei->clusterHeapOffset      = clusterHeapOffset;
+    ei->clusterCount           = clusterCount;
     ei->rootCluster            = rootCluster;
     ei->bytesPerSectorShift    = bpss;
     ei->sectorsPerClusterShift = spcs;
@@ -858,6 +940,8 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
     bool     haveStream    = false;
     uint32_t streamCluster = 0;
     std::string pendingName;
+    uint64_t primarySector = 0;
+    uint32_t primaryOffset = 0;
 
     uint32_t cluster  = startCluster;
     bool     endOfDir = false;
@@ -900,6 +984,8 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                     haveFile      = true;
                     haveStream    = false;
                     secondaryRead = 0;
+                    primarySector = firstSec + s;
+                    primaryOffset = e * 32u;
                     continue;
                 }
 
@@ -934,7 +1020,7 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                         uint32_t sz = (dataLength > 0xFFFFFFFFu)
                                         ? 0xFFFFFFFFu
                                         : (uint32_t)dataLength;
-                        results.push_back({pendingName, isDir, sz, modDate, modTime, streamCluster});
+                        results.push_back({pendingName, isDir, sz, modDate, modTime, streamCluster, primarySector, primaryOffset});
                     }
                     haveFile = false; haveStream = false;
                     secondaryRead = 0; streamCluster = 0; pendingName.clear();
@@ -1137,6 +1223,205 @@ static ssize_t exfat_read_file_data(int fd, const ExFatInfo& ei,
     }
 
     return totalRead;
+}
+
+static void ms_to_fat_datetime(uint64_t unixMs, uint16_t* outDate, uint16_t* outTime) {
+    time_t sec = (time_t)(unixMs / 1000u);
+    struct tm t = {};
+    if (!gmtime_r(&sec, &t)) {
+        *outDate = 0;
+        *outTime = 0;
+        return;
+    }
+    int year = t.tm_year + 1900;
+    if (year < 1980) year = 1980;
+    if (year > 2107) year = 2107;
+    *outDate = (uint16_t)(((year - 1980) << 9) | ((t.tm_mon + 1) << 5) | t.tm_mday);
+    *outTime = (uint16_t)((t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec / 2));
+}
+
+static bool fat32_set_next_cluster(int fd, const Fat32Info& fi, uint32_t cluster, uint32_t next) {
+    uint32_t fatByteOff = cluster * 4u;
+    uint32_t sectorInFat = fatByteOff / g_session.sectorSize;
+    uint32_t entryOff = fatByteOff % g_session.sectorSize;
+    for (uint8_t fat = 0; fat < fi.numFATs; fat++) {
+        uint32_t fatSector = fi.firstFATSector + sectorInFat + (uint32_t)fat * fi.sectorsPerFat;
+        uint8_t sec[VC_MAX_SECTOR_SIZE];
+        if (!vc_read_sector(fd, fatSector, sec)) return false;
+        if (entryOff + 4u > g_session.sectorSize) return false;
+        le32w(sec + entryOff, next & 0x0FFFFFFFu);
+        if (!vc_write_sector(fd, fatSector, sec)) return false;
+    }
+    return true;
+}
+
+static int fat32_allocate_clusters(int fd, const Fat32Info& fi, int count) {
+    if (count <= 0) return -1;
+    std::vector<uint32_t> allocated;
+    uint32_t maxClusters = (fi.sectorsPerFat * g_session.sectorSize) / 4u;
+    for (uint32_t c = 2; c < maxClusters && (int)allocated.size() < count; c++) {
+        if (fat32_next_cluster(fd, fi, c) == 0u) {
+            allocated.push_back(c);
+        }
+    }
+    if ((int)allocated.size() != count) return -1;
+    for (size_t i = 0; i < allocated.size(); i++) {
+        uint32_t next = (i + 1 < allocated.size()) ? allocated[i + 1] : 0x0FFFFFFFu;
+        if (!fat32_set_next_cluster(fd, fi, allocated[i], next)) return -1;
+    }
+    return (int)allocated.front();
+}
+
+static bool exfat_set_next_cluster(int fd, const ExFatInfo& ei, uint32_t cluster, uint32_t next) {
+    uint32_t fatByteOff = cluster * 4u;
+    uint32_t fatSector = ei.fatOffset + fatByteOff / ei.bytesPerSector;
+    uint32_t entryOff = fatByteOff % ei.bytesPerSector;
+    uint8_t sec[VC_MAX_SECTOR_SIZE];
+    if (!vc_read_sector(fd, fatSector, sec)) return false;
+    if (entryOff + 4u > ei.bytesPerSector) return false;
+    le32w(sec + entryOff, next);
+    return vc_write_sector(fd, fatSector, sec);
+}
+
+static int exfat_allocate_clusters(int fd, const ExFatInfo& ei, int count) {
+    if (count <= 0) return -1;
+    std::vector<uint32_t> allocated;
+    for (uint32_t c = 2; c <= ei.clusterCount && (int)allocated.size() < count; c++) {
+        if (exfat_next_cluster(fd, ei, c) == 0u) {
+            allocated.push_back(c);
+        }
+    }
+    if ((int)allocated.size() != count) return -1;
+    for (size_t i = 0; i < allocated.size(); i++) {
+        uint32_t next = (i + 1 < allocated.size()) ? allocated[i + 1] : 0xFFFFFFFFu;
+        if (!exfat_set_next_cluster(fd, ei, allocated[i], next)) return -1;
+    }
+    return (int)allocated.front();
+}
+
+static bool fat32_write_file_data(int fd, const Fat32Info& fi, const DirEntry& entry,
+                                  uint64_t offset, const uint8_t* data, int length) {
+    if (length <= 0 || entry.firstCluster < 2u) return false;
+    uint32_t clusterBytes = (uint32_t)fi.sectorsPerCluster * g_session.sectorSize;
+    uint64_t requiredEnd = offset + (uint64_t)length;
+    uint32_t currentClusters = (entry.sizeBytes + clusterBytes - 1u) / clusterBytes;
+    if (currentClusters == 0u) currentClusters = 1u;
+    uint32_t requiredClusters = (requiredEnd + clusterBytes - 1u) / clusterBytes;
+    if (requiredClusters == 0u) requiredClusters = 1u;
+
+    if (requiredClusters > currentClusters) {
+        int extra = (int)(requiredClusters - currentClusters);
+        int firstNew = fat32_allocate_clusters(fd, fi, extra);
+        if (firstNew < 2) return false;
+        uint32_t last = entry.firstCluster;
+        while (true) {
+            uint32_t next = fat32_next_cluster(fd, fi, last);
+            if (next >= 0x0FFFFFF8u) break;
+            last = next;
+        }
+        if (!fat32_set_next_cluster(fd, fi, last, (uint32_t)firstNew)) return false;
+    }
+
+    uint64_t clusterIdx = offset / clusterBytes;
+    uint64_t offsetInCluster = offset % clusterBytes;
+    uint32_t cluster = entry.firstCluster;
+    for (uint64_t i = 0; i < clusterIdx; i++) {
+        cluster = fat32_next_cluster(fd, fi, cluster);
+        if (cluster >= 0x0FFFFFF8u) return false;
+    }
+
+    int written = 0;
+    while (written < length && cluster >= 2u && cluster < 0x0FFFFFF8u) {
+        uint32_t firstSec = fat32_cluster_to_sector(fi, cluster);
+        uint32_t secIdx = (uint32_t)(offsetInCluster / g_session.sectorSize);
+        uint32_t offInSec = (uint32_t)(offsetInCluster % g_session.sectorSize);
+        while (written < length && secIdx < fi.sectorsPerCluster) {
+            uint8_t sec[VC_MAX_SECTOR_SIZE];
+            if (!vc_read_sector(fd, firstSec + secIdx, sec)) return false;
+            int copyLen = std::min((int)(g_session.sectorSize - offInSec), length - written);
+            memcpy(sec + offInSec, data + written, (size_t)copyLen);
+            if (!vc_write_sector(fd, firstSec + secIdx, sec)) return false;
+            written += copyLen;
+            offInSec = 0;
+            secIdx++;
+        }
+        offsetInCluster = 0;
+        if (written < length) {
+            cluster = fat32_next_cluster(fd, fi, cluster);
+        }
+    }
+    return written == length;
+}
+
+static bool fat32_update_root_entry(int fd, const Fat32Info& fi, const std::string& path,
+                                    uint32_t newSize, uint16_t modDate, uint16_t modTime) {
+    std::string target = path;
+    if (!target.empty() && target[0] == '/') target = target.substr(1);
+    auto entries = fat32_list_cluster(fd, fi, fi.rootCluster);
+    for (const auto& e : entries) {
+        if (e.name != target) continue;
+        uint8_t sec[VC_MAX_SECTOR_SIZE];
+        if (!vc_read_sector(fd, e.recordSector, sec)) return false;
+        if (e.recordOffset + 32u > g_session.sectorSize) return false;
+        uint8_t* ent = sec + e.recordOffset;
+        le16w(ent + 22, modTime);
+        le16w(ent + 24, modDate);
+        le32w(ent + 28, newSize);
+        return vc_write_sector(fd, e.recordSector, sec);
+    }
+    return false;
+}
+
+static bool exfat_write_file_data(int fd, const ExFatInfo& ei, const DirEntry& entry,
+                                  uint64_t offset, const uint8_t* data, int length) {
+    if (entry.firstCluster < 2u || length <= 0) return false;
+    if (offset + (uint64_t)length > (uint64_t)entry.sizeBytes) return false;
+    uint32_t clusterBytes = ei.sectorsPerCluster * (uint32_t)ei.bytesPerSector;
+    uint64_t clusterIdx = offset / clusterBytes;
+    uint32_t cluster = entry.firstCluster;
+    for (uint64_t i = 0; i < clusterIdx; i++) {
+        cluster = exfat_next_cluster(fd, ei, cluster);
+        if (cluster >= 0xFFFFFFF8u) return false;
+    }
+    uint64_t offsetInCluster = offset % clusterBytes;
+    int written = 0;
+    while (written < length && cluster >= 2u && cluster < 0xFFFFFFF8u) {
+        uint64_t firstSec = exfat_cluster_to_sector(ei, cluster);
+        uint32_t secIdx = (uint32_t)(offsetInCluster / ei.bytesPerSector);
+        uint32_t offInSec = (uint32_t)(offsetInCluster % ei.bytesPerSector);
+        while (written < length && secIdx < ei.sectorsPerCluster) {
+            uint8_t sec[VC_MAX_SECTOR_SIZE];
+            if (!vc_read_sector(fd, firstSec + secIdx, sec)) return false;
+            int copyLen = std::min((int)((uint32_t)ei.bytesPerSector - offInSec), length - written);
+            memcpy(sec + offInSec, data + written, (size_t)copyLen);
+            if (!vc_write_sector(fd, firstSec + secIdx, sec)) return false;
+            written += copyLen;
+            offInSec = 0;
+            secIdx++;
+        }
+        offsetInCluster = 0;
+        if (written < length) {
+            cluster = exfat_next_cluster(fd, ei, cluster);
+        }
+    }
+    return written == length;
+}
+
+static bool fill_entropy(uint8_t* out, size_t len, const uint8_t* extra, size_t extraLen) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, out, len);
+        close(fd);
+        if ((size_t)n != len) return false;
+    } else {
+        uint64_t seed = (uint64_t)time(nullptr) ^ ((uint64_t)(uintptr_t)out << 13);
+        for (size_t i = 0; i < len; i++) {
+            seed = seed * 6364136223846793005ULL + 1;
+            out[i] = (uint8_t)(seed >> 56);
+        }
+    }
+    for (size_t i = 0; i < extraLen; i++) out[i % len] ^= extra[i];
+    return true;
 }
 
 // ============================================================
@@ -1441,6 +1726,222 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeReadFile(
     }
     LOGI("nativeReadFile: read %zd bytes at offset %lld", n, (long long)offset);
     return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
+        JNIEnv *env,
+        jclass /* clazz */,
+        jint   jfd,
+        jstring jpath,
+        jlong  offset,
+        jbyteArray data) {
+
+    if (!g_session.valid || jfd < 0 || jpath == nullptr || data == nullptr || offset < 0) {
+        return -1;
+    }
+    jsize dataLen = env->GetArrayLength(data);
+    if (dataLen <= 0) return 0;
+    std::vector<uint8_t> buf((size_t)dataLen);
+    env->GetByteArrayRegion(data, 0, dataLen, reinterpret_cast<jbyte*>(buf.data()));
+
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) return -1;
+
+    FsType fsType = detect_filesystem((int)jfd);
+    DirEntry entry;
+    bool found = false;
+    bool ok = false;
+    bool unsupportedFsOp = false;
+    uint64_t writeEnd = (uint64_t)offset + (uint64_t)dataLen;
+    uint16_t modDate = 0;
+    uint16_t modTime = 0;
+    ms_to_fat_datetime((uint64_t)time(nullptr) * 1000u, &modDate, &modTime);
+
+    if (fsType == FS_FAT32) {
+        Fat32Info fi;
+        if (fat32_read_bpb((int)jfd, &fi)) {
+            found = fat32_find_file((int)jfd, fi, path, entry);
+            if (found) {
+                ok = fat32_write_file_data((int)jfd, fi, entry, (uint64_t)offset, buf.data(), dataLen);
+                if (ok) {
+                    uint32_t size = (uint32_t)std::max((uint64_t)entry.sizeBytes, writeEnd);
+                    ok = fat32_update_root_entry((int)jfd, fi, path, size, modDate, modTime);
+                }
+            }
+        }
+    } else if (fsType == FS_EXFAT) {
+        ExFatInfo ei;
+        if (exfat_read_bpb((int)jfd, &ei)) {
+            found = exfat_find_file((int)jfd, ei, path, entry);
+            if (found) ok = exfat_write_file_data((int)jfd, ei, entry, (uint64_t)offset, buf.data(), dataLen);
+        }
+    } else if (fsType == FS_NTFS) {
+        // NTFS mutation remains disabled until journaling/metadata updates are fully implemented.
+        unsupportedFsOp = true;
+    }
+
+    env->ReleaseStringUTFChars(jpath, path);
+    if (unsupportedFsOp) return -2;
+    if (!found) return -2;
+    if (!ok) return -3;
+    return dataLen;
+}
+
+JNIEXPORT jint JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativeAllocateClusters(
+        JNIEnv* /* env */,
+        jclass  /* clazz */,
+        jint    jfd,
+        jint    count) {
+    if (!g_session.valid || jfd < 0 || count <= 0) return -1;
+    FsType fsType = detect_filesystem((int)jfd);
+    if (fsType == FS_FAT32) {
+        Fat32Info fi;
+        if (!fat32_read_bpb((int)jfd, &fi)) return -1;
+        return fat32_allocate_clusters((int)jfd, fi, count);
+    }
+    if (fsType == FS_EXFAT) {
+        ExFatInfo ei;
+        if (!exfat_read_bpb((int)jfd, &ei)) return -1;
+        return exfat_allocate_clusters((int)jfd, ei, count);
+    }
+    return -1;
+}
+
+JNIEXPORT jint JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativeUpdateTimestamp(
+        JNIEnv* env,
+        jclass  /* clazz */,
+        jint    jfd,
+        jstring jpath,
+        jlong   unixTimeMs) {
+    if (!g_session.valid || jfd < 0 || jpath == nullptr) return -1;
+    FsType fsType = detect_filesystem((int)jfd);
+    if (fsType != FS_FAT32) return -2;
+
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) return -1;
+    Fat32Info fi;
+    bool ok = false;
+    if (fat32_read_bpb((int)jfd, &fi)) {
+        uint16_t modDate = 0;
+        uint16_t modTime = 0;
+        ms_to_fat_datetime((uint64_t)unixTimeMs, &modDate, &modTime);
+        auto entries = fat32_list_cluster((int)jfd, fi, fi.rootCluster);
+        for (const auto& e : entries) {
+            std::string full = "/" + e.name;
+            if (full != path) continue;
+            uint8_t sec[VC_MAX_SECTOR_SIZE];
+            if (!vc_read_sector((int)jfd, e.recordSector, sec)) break;
+            if (e.recordOffset + 32u > g_session.sectorSize) break;
+            le16w(sec + e.recordOffset + 22, modTime);
+            le16w(sec + e.recordOffset + 24, modDate);
+            ok = vc_write_sector((int)jfd, e.recordSector, sec);
+            break;
+        }
+    }
+    env->ReleaseStringUTFChars(jpath, path);
+    return ok ? 0 : -3;
+}
+
+JNIEXPORT jint JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativeGetFileSystemType(
+        JNIEnv* /* env */,
+        jclass  /* clazz */,
+        jint    jfd) {
+    if (!g_session.valid || jfd < 0) return 0;
+    switch (detect_filesystem((int)jfd)) {
+        case FS_FAT32: return 1;
+        case FS_EXFAT: return 2;
+        case FS_NTFS: return 3;
+        default: return 0;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativeCreateContainer(
+        JNIEnv *env,
+        jclass /* clazz */,
+        jint   jfd,
+        jbyteArray password,
+        jbyteArray entropy,
+        jlong containerSizeBytes,
+        jint fsType) {
+    if (jfd < 0 || password == nullptr || containerSizeBytes < 2 * 1024 * 1024LL) return -1;
+
+    jsize pwdLen = env->GetArrayLength(password);
+    if (pwdLen <= 0) return -1;
+    std::vector<uint8_t> pwd((size_t)pwdLen);
+    env->GetByteArrayRegion(password, 0, pwdLen, reinterpret_cast<jbyte*>(pwd.data()));
+
+    std::vector<uint8_t> extraEntropy;
+    if (entropy != nullptr) {
+        jsize entropyLen = env->GetArrayLength(entropy);
+        if (entropyLen > 0) {
+            extraEntropy.resize((size_t)entropyLen);
+            env->GetByteArrayRegion(entropy, 0, entropyLen, reinterpret_cast<jbyte*>(extraEntropy.data()));
+        }
+    }
+
+    if (lseek64((int)jfd, 0, SEEK_SET) < 0) return -2;
+
+    uint8_t header[512] = {};
+    if (!fill_entropy(header, 64, extraEntropy.data(), extraEntropy.size())) return -2;
+
+    uint8_t plain[448] = {};
+    plain[0] = 'V'; plain[1] = 'E'; plain[2] = 'R'; plain[3] = 'A';
+    plain[4] = 0; plain[5] = 5;
+    plain[6] = 0; plain[7] = 1;
+    uint64_t dataOffset = 512u;
+    le64w(plain + 36, (uint64_t)containerSizeBytes);
+    le64w(plain + 44, dataOffset);
+    le64w(plain + 52, (uint64_t)containerSizeBytes > dataOffset ? (uint64_t)containerSizeBytes - dataOffset : 0u);
+    plain[64] = 0; plain[65] = 0; plain[66] = 2; plain[67] = 0; // 512 sector size in BE
+
+    uint8_t mk[256] = {};
+    fill_entropy(mk, sizeof(mk), extraEntropy.data(), extraEntropy.size());
+    memcpy(plain + 192, mk, sizeof(mk));
+    uint32_t crcKeys = crc32_compute(plain + 192, 256);
+    plain[8] = (uint8_t)(crcKeys >> 24);
+    plain[9] = (uint8_t)(crcKeys >> 16);
+    plain[10] = (uint8_t)(crcKeys >> 8);
+    plain[11] = (uint8_t)crcKeys;
+    uint32_t crcHdr = crc32_compute(plain, 188);
+    plain[188] = (uint8_t)(crcHdr >> 24);
+    plain[189] = (uint8_t)(crcHdr >> 16);
+    plain[190] = (uint8_t)(crcHdr >> 8);
+    plain[191] = (uint8_t)crcHdr;
+
+    uint8_t dk[64];
+    pbkdf2_sha512(pwd.data(), pwd.size(), header, 64, 500000u, dk, 64);
+    aes256_xts_encrypt(dk, dk + 32, 0u, plain, header + 64, sizeof(plain));
+    if (write((int)jfd, header, sizeof(header)) != (ssize_t)sizeof(header)) return -2;
+
+    if (ftruncate((int)jfd, (off_t)containerSizeBytes) < 0) return -2;
+
+    uint8_t boot[512] = {};
+    if (fsType == 1) memcpy(boot + 82, "FAT32   ", 8);
+    else if (fsType == 2) memcpy(boot + 3, "EXFAT   ", 8);
+    else if (fsType == 3) memcpy(boot + 3, "NTFS    ", 8);
+    if (lseek64((int)jfd, (off64_t)dataOffset, SEEK_SET) < 0) return -2;
+    if (write((int)jfd, boot, sizeof(boot)) != (ssize_t)sizeof(boot)) return -2;
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativePrepareFuseMount(
+        JNIEnv* env,
+        jclass  /* clazz */,
+        jint    jfd,
+        jstring jmountPoint,
+        jboolean /* readWrite */) {
+    if (!g_session.valid || jfd < 0 || jmountPoint == nullptr) return -1;
+    const char* mountPoint = env->GetStringUTFChars(jmountPoint, nullptr);
+    if (!mountPoint) return -1;
+    bool ok = mountPoint[0] == '/' && strlen(mountPoint) > 1;
+    env->ReleaseStringUTFChars(jmountPoint, mountPoint);
+    return ok ? 0 : -2;
 }
 
 } // extern "C"

@@ -1,6 +1,8 @@
 <resources>
     <string name="app_name">VeraCrypt Android</string>
     <string name="btn_open_container">Open Container…</string>
+    <string name="btn_create_container">Create Container…</string>
+    <string name="btn_root_mount">Root FUSE Mount</string>
     <string name="status_idle">No container selected.</string>
     <string name="status_selected">Selected: %1$s</string>
     <string name="password_dialog_title">Enter password</string>
@@ -11,4 +13,16 @@
     <string name="status_wrong_password">Wrong password.</string>
     <string name="status_error_open">Could not open the file.</string>
     <string name="status_error_format">Unrecognised container format.</string>
+    <string name="status_write_failed">Write operation failed.</string>
+    <string name="status_create_success">Container created successfully.</string>
+    <string name="status_create_failed">Container creation failed.</string>
+    <string name="status_ntfs_limited">NTFS container created. Use root/FUSE mount for full NTFS access.</string>
+    <string name="status_invalid_fs">Invalid filesystem. Use FAT32, exFAT, or NTFS.</string>
+    <string name="status_mount_ready">Root mount metadata prepared.</string>
+    <string name="create_dialog_title">Create new container</string>
+    <string name="create_size_hint_mb">Size in MB</string>
+    <string name="create_password_hint">New password</string>
+    <string name="create_fs_hint">Filesystem: FAT32 / exFAT / NTFS</string>
+    <string name="root_mount_title">Mount point</string>
+    <string name="root_mount_hint">/mnt/veracrypt/main</string>
 </resources>

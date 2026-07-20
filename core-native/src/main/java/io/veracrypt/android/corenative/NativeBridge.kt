@@ -66,7 +66,65 @@ object NativeBridge {
     @JvmStatic
     external fun nativeReadFile(fd: Int, path: String, offset: Long, length: Int): ByteArray?
 
+    /**
+     * Write [data] into an existing file [path] at [offset].
+     *
+     * Returns bytes written, or a negative status code:
+     *  -1 wrong state/arguments
+     *  -2 file not found / unsupported filesystem operation
+     *  -3 I/O error
+     */
+    @JvmStatic
+    external fun nativeWriteFile(fd: Int, path: String, offset: Long, data: ByteArray): Int
+
+    /**
+     * Allocate [count] clusters in the currently mounted filesystem.
+     *
+     * Returns first allocated cluster (>1) or a negative status code.
+     */
+    @JvmStatic
+    external fun nativeAllocateClusters(fd: Int, count: Int): Int
+
+    /**
+     * Update last-modified metadata for a root-level entry at [path].
+     *
+     * @return 0 on success, negative on error.
+     */
+    @JvmStatic
+    external fun nativeUpdateTimestamp(fd: Int, path: String, unixTimeMs: Long): Int
+
+    /** Returns 0 unknown, 1 FAT32, 2 exFAT, 3 NTFS. */
+    @JvmStatic
+    external fun nativeGetFileSystemType(fd: Int): Int
+
+    /**
+     * Create a new encrypted container image.
+     *
+     * @param fd writable file descriptor.
+     * @param password passphrase bytes (UTF-8).
+     * @param entropy additional caller entropy bytes.
+     * @param containerSizeBytes output file size in bytes.
+     * @param fsType 1 FAT32, 2 exFAT, 3 NTFS.
+     * @return 0 on success, negative on error.
+     */
+    @JvmStatic
+    external fun nativeCreateContainer(
+        fd: Int,
+        password: ByteArray,
+        entropy: ByteArray,
+        containerSizeBytes: Long,
+        fsType: Int
+    ): Int
+
+    /**
+     * Root-only best-effort mount integration hook.
+     *
+     * Native side currently validates parameters and prepares mount metadata.
+     * Returns 0 when the request is accepted.
+     */
+    @JvmStatic
+    external fun nativePrepareFuseMount(fd: Int, mountPoint: String, readWrite: Boolean): Int
+
     /** Convenience: returns the native library version. */
     fun version(): String = nativeGetVersion()
 }
-

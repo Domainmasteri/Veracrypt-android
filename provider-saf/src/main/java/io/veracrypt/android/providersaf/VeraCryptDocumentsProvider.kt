@@ -55,6 +55,8 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
         /** Synthetic document ID representing the root of the container file system. */
         private const val ROOT_DOCUMENT_ID = "/"
+        private const val FS_FAT32 = 1
+        private const val FS_EXFAT = 2
 
         /** The open [ParcelFileDescriptor] passed to [mount].  Owned by this provider. */
         @Volatile
@@ -144,6 +146,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         val fd = mountedFd
         if (fd < 0) return result
+        val writableFs = supportsWrite(fd)
 
         try {
             val entries = NativeBridge.nativeListDir(fd, parentDocumentId) ?: return result
@@ -155,7 +158,11 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                         if (entry.isDirectory) Document.MIME_TYPE_DIR else MIME_TYPE_VERACRYPT)
                     add(Document.COLUMN_DISPLAY_NAME,  entry.name)
                     add(Document.COLUMN_LAST_MODIFIED, entry.lastModifiedMs.takeIf { it > 0L })
-                    add(Document.COLUMN_FLAGS,         0)
+                    add(
+                        Document.COLUMN_FLAGS,
+                        if (entry.isDirectory || !writableFs) 0 else
+                            Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE
+                    )
                     add(Document.COLUMN_SIZE,
                         if (entry.isDirectory) null else entry.sizeBytes)
                 }
@@ -172,9 +179,6 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         mode: String,
         signal: CancellationSignal?
     ): ParcelFileDescriptor {
-        if (mode != "r") {
-            throw UnsupportedOperationException("VeraCryptDocumentsProvider is read-only")
-        }
         val fd = mountedFd
         if (fd < 0) {
             throw IllegalStateException("No VeraCrypt container is currently mounted")
@@ -183,32 +187,59 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         // Use the cached file size when available so we can terminate the loop exactly.
         val fileSize = entryCache[documentId]?.sizeBytes ?: -1L
 
-        val pipes     = ParcelFileDescriptor.createReliablePipe()
+        val writable = mode.contains("w")
+        if (writable && !supportsWrite(fd)) {
+            throw UnsupportedOperationException("Write is not supported for this filesystem")
+        }
+        val pipes = if (writable) {
+            ParcelFileDescriptor.createPipe()
+        } else {
+            ParcelFileDescriptor.createReliablePipe()
+        }
         val readEnd   = pipes[0]
         val writeEnd  = pipes[1]
 
         val thread = Thread {
             try {
-                ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
-                    val chunkSize = 65536 // 64 KiB per native call
-                    var offset    = 0L
-                    while (true) {
-                        if (signal?.isCanceled == true) break
-
-                        val toRead: Int = if (fileSize > 0L) {
-                            minOf(chunkSize.toLong(), fileSize - offset).toInt()
-                        } else {
-                            chunkSize
+                if (writable) {
+                    ParcelFileDescriptor.AutoCloseInputStream(readEnd).use { input ->
+                        val chunk = ByteArray(65536)
+                        var offset = 0L
+                        while (true) {
+                            if (signal?.isCanceled == true) break
+                            val n = input.read(chunk)
+                            if (n <= 0) break
+                            val toWrite = if (n == chunk.size) chunk else chunk.copyOf(n)
+                            val written = NativeBridge.nativeWriteFile(fd, documentId, offset, toWrite)
+                            if (written <= 0) break
+                            offset += written
                         }
-                        if (toRead <= 0) break
+                    }
+                    if (fileSize >= 0L) {
+                        NativeBridge.nativeUpdateTimestamp(fd, documentId, System.currentTimeMillis())
+                    }
+                } else {
+                    ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
+                        val chunkSize = 65536 // 64 KiB per native call
+                        var offset = 0L
+                        while (true) {
+                            if (signal?.isCanceled == true) break
 
-                        val chunk = NativeBridge.nativeReadFile(fd, documentId, offset, toRead)
-                        if (chunk == null || chunk.isEmpty()) break
+                            val toRead: Int = if (fileSize > 0L) {
+                                minOf(chunkSize.toLong(), fileSize - offset).toInt()
+                            } else {
+                                chunkSize
+                            }
+                            if (toRead <= 0) break
 
-                        out.write(chunk)
-                        offset += chunk.size
+                            val chunk = NativeBridge.nativeReadFile(fd, documentId, offset, toRead)
+                            if (chunk == null || chunk.isEmpty()) break
 
-                        if (chunk.size < toRead) break // native signalled EOF
+                            out.write(chunk)
+                            offset += chunk.size
+
+                            if (chunk.size < toRead) break // native signalled EOF
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -220,7 +251,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         thread.name = "veracrypt-read-${documentId.substringAfterLast('/')}"
         thread.start()
 
-        return readEnd
+        return if (writable) writeEnd else readEnd
     }
 
     // -------------------------------------------------------------------------
@@ -229,13 +260,18 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
     /** Add a row built from a cached [VolumeEntry]. */
     private fun addEntryRow(cursor: MatrixCursor, entry: VolumeEntry) {
+        val writableFs = mountedFd >= 0 && supportsWrite(mountedFd)
         cursor.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID,   entry.path)
             add(Document.COLUMN_MIME_TYPE,
                 if (entry.isDirectory) Document.MIME_TYPE_DIR else MIME_TYPE_VERACRYPT)
             add(Document.COLUMN_DISPLAY_NAME,  entry.name)
             add(Document.COLUMN_LAST_MODIFIED, entry.lastModifiedMs.takeIf { it > 0L })
-            add(Document.COLUMN_FLAGS,         0)
+            add(
+                Document.COLUMN_FLAGS,
+                if (entry.isDirectory || !writableFs) 0 else
+                    Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE
+            )
             add(Document.COLUMN_SIZE,
                 if (entry.isDirectory) null else entry.sizeBytes)
         }
@@ -255,5 +291,11 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             add(Document.COLUMN_SIZE,          null)
         }
     }
-}
 
+    private fun supportsWrite(fd: Int): Boolean {
+        return when (NativeBridge.nativeGetFileSystemType(fd)) {
+            FS_FAT32, FS_EXFAT -> true
+            else -> false
+        }
+    }
+}
