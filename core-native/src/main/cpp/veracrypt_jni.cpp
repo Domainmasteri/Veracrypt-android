@@ -1,7 +1,8 @@
 /*
  * veracrypt_jni.cpp
  *
- * JNI bridge for VeraCrypt volume-header parsing.
+ * JNI bridge for VeraCrypt volume-header parsing, sector decryption, and
+ * FAT32 directory listing.
  *
  * Implements PBKDF2-HMAC-SHA512 key derivation and AES-256-XTS header
  * decryption entirely in self-contained C++17 without external crypto
@@ -20,7 +21,7 @@
  *   12 – 27  Reserved
  *   28 – 35  Hidden-volume size (uint64 BE)
  *   36 – 43  Volume size (uint64 BE)
- *   44 – 51  Key-scope offset (uint64 BE)
+ *   44 – 51  Key-scope offset (uint64 BE)  = byte offset of first data sector
  *   52 – 59  Encrypted-area size (uint64 BE)
  *   60 – 63  Flags (uint32 BE)
  *   64 – 67  Sector size (uint32 BE)
@@ -33,10 +34,16 @@
 #include <android/log.h>
 #include <cstring>
 #include <cstdint>
+#include <unistd.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <time.h>
 
 #define LOG_TAG "VeraCrypt-Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
 
 // ============================================================
 // SHA-512
@@ -414,6 +421,311 @@ static uint32_t crc32_compute(const uint8_t *data, size_t len) {
 }
 
 // ============================================================
+// Session state
+// Stores master keys and volume parameters after a successful
+// nativeParseHeader call so that nativeListDir can reuse them.
+// Not thread-safe; callers must serialize access.
+// ============================================================
+
+#define VC_MAX_SECTOR_SIZE 4096
+
+struct VCSession {
+    bool     valid;
+    uint8_t  masterKey1[32];  // AES-256 data encryption key
+    uint8_t  masterKey2[32];  // AES-256 tweak key
+    uint64_t dataOffset;      // byte offset of the first data sector in the file
+    uint32_t sectorSize;      // bytes per logical sector (from volume header)
+};
+
+static VCSession g_session = {};
+
+// ============================================================
+// Little-endian helpers
+// ============================================================
+
+static inline uint16_t le16r(const uint8_t* p) {
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+static inline uint32_t le32r(const uint8_t* p) {
+    return (uint32_t)(p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24));
+}
+
+// ============================================================
+// Sector reader
+// Reads one logical sector from fd, decrypts it with AES-256-XTS,
+// and writes the plaintext to outBuf (must be at least sectorSize bytes).
+// sectorNo is the logical data-sector index starting at 0.
+// ============================================================
+
+static bool vc_read_sector(int fd, uint64_t sectorNo, uint8_t outBuf[VC_MAX_SECTOR_SIZE]) {
+    if (!g_session.valid) return false;
+
+    uint32_t sz = g_session.sectorSize;
+    if (sz == 0 || sz > VC_MAX_SECTOR_SIZE) {
+        LOGE("vc_read_sector: unexpected sector size %u", sz);
+        return false;
+    }
+
+    off64_t fileOff = (off64_t)(g_session.dataOffset + sectorNo * (uint64_t)sz);
+    if (lseek64(fd, fileOff, SEEK_SET) < 0) {
+        LOGE("vc_read_sector: lseek failed for sector %llu", (unsigned long long)sectorNo);
+        return false;
+    }
+
+    uint8_t enc[VC_MAX_SECTOR_SIZE];
+    ssize_t n = read(fd, enc, sz);
+    if (n != (ssize_t)sz) {
+        LOGE("vc_read_sector: read %zd of %u bytes at sector %llu", n, sz, (unsigned long long)sectorNo);
+        return false;
+    }
+
+    aes256_xts_decrypt(g_session.masterKey1, g_session.masterKey2, sectorNo, enc, outBuf, sz);
+    return true;
+}
+
+// ============================================================
+// FAT32 parser (read-only)
+// ============================================================
+
+struct DirEntry {
+    std::string name;
+    bool        isDir;
+    uint32_t    sizeBytes;
+    uint16_t    modDate;  // FAT date encoding
+    uint16_t    modTime;  // FAT time encoding
+};
+
+// Convert a UCS-2LE code point to UTF-8; returns number of bytes written (1-3).
+static int ucs2_to_utf8(uint16_t c, char* out) {
+    if (c < 0x80u) {
+        out[0] = (char)c;
+        return 1;
+    } else if (c < 0x800u) {
+        out[0] = (char)(0xC0u | (c >> 6));
+        out[1] = (char)(0x80u | (c & 0x3Fu));
+        return 2;
+    } else {
+        out[0] = (char)(0xE0u | (c >> 12));
+        out[1] = (char)(0x80u | ((c >> 6) & 0x3Fu));
+        out[2] = (char)(0x80u | (c & 0x3Fu));
+        return 3;
+    }
+}
+
+// Convert a FAT 8.3 directory-entry name field to a trimmed string.
+static std::string fat_83_to_string(const uint8_t* name11) {
+    std::string base, ext;
+    for (int i = 0; i < 8; i++) {
+        if (name11[i] == ' ') break;
+        base += (char)name11[i];
+    }
+    for (int i = 8; i < 11; i++) {
+        if (name11[i] == ' ') break;
+        ext += (char)name11[i];
+    }
+    return ext.empty() ? base : base + "." + ext;
+}
+
+// Convert FAT date+time to milliseconds since the Unix epoch (UTC).
+static uint64_t fat_datetime_to_ms(uint16_t date, uint16_t time) {
+    int year  = ((date >> 9) & 0x7F) + 1980;
+    int month = (date >> 5) & 0x0F;
+    int day   = date & 0x1F;
+    int hour  = (time >> 11) & 0x1F;
+    int min   = (time >> 5)  & 0x3F;
+    int sec   = (time & 0x1F) * 2;
+
+    if (month < 1 || month > 12 || day < 1 || day > 31) return 0;
+
+    struct tm t = {};
+    t.tm_year = year - 1900;
+    t.tm_mon  = month - 1;
+    t.tm_mday = day;
+    t.tm_hour = hour;
+    t.tm_min  = min;
+    t.tm_sec  = sec;
+    t.tm_isdst = -1;
+    time_t ts = mktime(&t);
+    return (ts == (time_t)-1) ? 0 : (uint64_t)ts * 1000u;
+}
+
+struct Fat32Info {
+    uint16_t bytesPerSector;
+    uint8_t  sectorsPerCluster;
+    uint32_t firstFATSector;   // logical sector index of the first FAT
+    uint32_t firstDataSector;  // logical sector index of cluster 2
+    uint32_t rootCluster;
+};
+
+// Read and parse the FAT32 BIOS Parameter Block (sector 0 of the data area).
+static bool fat32_read_bpb(int fd, Fat32Info* fi) {
+    uint8_t sec[VC_MAX_SECTOR_SIZE];
+    if (!vc_read_sector(fd, 0, sec)) {
+        LOGE("fat32_read_bpb: could not read sector 0");
+        return false;
+    }
+
+    uint16_t bps     = le16r(sec + 11);
+    uint8_t  spc     = sec[13];
+    uint16_t rsc     = le16r(sec + 14);
+    uint8_t  numFATs = sec[16];
+    uint32_t spf32   = le32r(sec + 36);
+    uint32_t rootCls = le32r(sec + 44);
+
+    if (bps == 0 || spc == 0 || numFATs == 0 || spf32 == 0) {
+        LOGE("fat32_read_bpb: invalid BPB values bps=%u spc=%u numFATs=%u spf32=%u",
+             bps, spc, numFATs, spf32);
+        return false;
+    }
+
+    fi->bytesPerSector    = bps;
+    fi->sectorsPerCluster = spc;
+    fi->firstFATSector    = rsc;
+    fi->firstDataSector   = rsc + (uint32_t)numFATs * spf32;
+    fi->rootCluster       = rootCls;
+
+    LOGI("fat32_read_bpb: bps=%u spc=%u firstFAT=%u firstData=%u rootClus=%u",
+         bps, spc, fi->firstFATSector, fi->firstDataSector, rootCls);
+    return true;
+}
+
+// Return the logical sector index for the start of a given cluster (>= 2).
+static uint32_t fat32_cluster_to_sector(const Fat32Info& fi, uint32_t cluster) {
+    if (cluster < 2) return fi.firstDataSector;
+    return fi.firstDataSector + (cluster - 2u) * (uint32_t)fi.sectorsPerCluster;
+}
+
+// Follow the FAT chain: return the cluster that follows `cluster`.
+// Returns 0x0FFFFFFF (end-of-chain marker) on error or EOF.
+static uint32_t fat32_next_cluster(int fd, const Fat32Info& fi, uint32_t cluster) {
+    uint32_t fatByteOff  = cluster * 4u;
+    uint32_t fatSector   = fi.firstFATSector + fatByteOff / g_session.sectorSize;
+    uint32_t entryOff    = fatByteOff % g_session.sectorSize;
+
+    uint8_t sec[VC_MAX_SECTOR_SIZE];
+    if (!vc_read_sector(fd, fatSector, sec)) return 0x0FFFFFFFu;
+    if (entryOff + 4u > g_session.sectorSize) return 0x0FFFFFFFu;
+
+    return le32r(sec + entryOff) & 0x0FFFFFFFu;
+}
+
+// Read a string of UCS-2LE characters from a LFN directory entry.
+// offsets[] and counts[] describe which byte positions / how many chars each holds.
+static std::string lfn_extract_chars(const uint8_t* entry,
+                                     const int offsets[], const int counts[], int groups) {
+    std::string result;
+    for (int g = 0; g < groups; g++) {
+        for (int c = 0; c < counts[g]; c++) {
+            int o = offsets[g] + c * 2;
+            uint16_t ch = (uint16_t)(entry[o] | ((uint16_t)entry[o + 1] << 8));
+            if (ch == 0x0000u || ch == 0xFFFFu) return result;
+            char buf[4];
+            int nb = ucs2_to_utf8(ch, buf);
+            result.append(buf, (size_t)nb);
+        }
+    }
+    return result;
+}
+
+// List all (non-deleted, non-dot) entries in the directory starting at startCluster.
+static std::vector<DirEntry> fat32_list_cluster(int fd, const Fat32Info& fi,
+                                                 uint32_t startCluster) {
+    std::vector<DirEntry> results;
+
+    // LFN accumulation: seq → piece (seq 1 = first chars, highest seq = last chars on disk)
+    // We accumulate piece strings indexed by (seq-1) then concatenate in order.
+    static const int LFN_MAX_SEQ = 20; // 20 × 13 chars = 260 > MAX_PATH
+    std::string lfnParts[LFN_MAX_SEQ];
+    int         lfnMaxSeq = 0;
+    bool        haveLFN   = false;
+
+    static const int LFN_OFF[]  = {1, 14, 28};
+    static const int LFN_CNT[]  = {5,  6,  2};
+
+    uint32_t cluster = startCluster;
+    bool endOfDir = false;
+
+    while (!endOfDir && cluster >= 2u && cluster < 0x0FFFFFF8u) {
+        uint32_t firstSec = fat32_cluster_to_sector(fi, cluster);
+
+        for (uint8_t s = 0; !endOfDir && s < fi.sectorsPerCluster; s++) {
+            uint8_t sec[VC_MAX_SECTOR_SIZE];
+            if (!vc_read_sector(fd, firstSec + s, sec)) break;
+
+            uint32_t sectorBytes     = g_session.sectorSize;
+            uint32_t entriesPerSector = sectorBytes / 32u;
+
+            for (uint32_t e = 0; e < entriesPerSector; e++) {
+                const uint8_t* ent = sec + e * 32u;
+
+                if (ent[0] == 0x00u) { endOfDir = true; break; } // end of directory
+                if (ent[0] == 0xE5u) {                            // deleted entry
+                    haveLFN = false; lfnMaxSeq = 0;
+                    continue;
+                }
+
+                uint8_t attr = ent[11];
+
+                if (attr == 0x0Fu) {
+                    // Long File Name entry
+                    uint8_t seq    = ent[0] & 0x1Fu;
+                    bool    isLast = (ent[0] & 0x40u) != 0u; // "last" = highest seq, on disk first
+
+                    if (isLast) {
+                        // Reset accumulator for a new LFN sequence
+                        for (int i = 0; i < LFN_MAX_SEQ; i++) lfnParts[i].clear();
+                        lfnMaxSeq = (int)seq;
+                        haveLFN   = true;
+                    }
+
+                    if (haveLFN && seq >= 1u && seq <= (uint8_t)LFN_MAX_SEQ) {
+                        lfnParts[seq - 1] = lfn_extract_chars(ent, LFN_OFF, LFN_CNT, 3);
+                    }
+                    continue;
+                }
+
+                // Skip volume-ID and pure-system entries
+                if (attr & 0x08u) { haveLFN = false; lfnMaxSeq = 0; continue; }
+
+                // Ordinary file or sub-directory entry
+                std::string name;
+                if (haveLFN && lfnMaxSeq > 0) {
+                    for (int i = 0; i < lfnMaxSeq && i < LFN_MAX_SEQ; i++) name += lfnParts[i];
+                } else {
+                    name = fat_83_to_string(ent);
+                }
+                haveLFN = false; lfnMaxSeq = 0;
+
+                if (name == "." || name == "..") continue;
+                if (name.empty()) continue;
+
+                bool     isDir = (attr & 0x10u) != 0u;
+                uint32_t fsize = le32r(ent + 28);
+                uint16_t mdate = le16r(ent + 24);
+                uint16_t mtime = le16r(ent + 22);
+
+                results.push_back({name, isDir, fsize, mdate, mtime});
+            }
+        }
+
+        if (!endOfDir) cluster = fat32_next_cluster(fd, fi, cluster);
+    }
+
+    return results;
+}
+
+// Resolve `path` to a cluster number.  Only root ("/") is supported in this
+// milestone; deeper paths always return 0 (not found).
+static uint32_t fat32_find_dir(const Fat32Info& fi, const char* path) {
+    if (path == nullptr || path[0] == '\0' ||
+        (path[0] == '/' && path[1] == '\0')) {
+        return fi.rootCluster;
+    }
+    LOGE("fat32_find_dir: sub-directory navigation not yet implemented (%s)", path);
+    return 0u;
+}
+
+// ============================================================
 // JNI entry points
 // ============================================================
 
@@ -423,74 +735,74 @@ JNIEXPORT jstring JNICALL
 Java_io_veracrypt_android_corenative_NativeBridge_nativeGetVersion(
         JNIEnv *env,
         jclass /* clazz */) {
-    return env->NewStringUTF("0.2.0");
+    return env->NewStringUTF("0.3.0");
 }
 
 /**
  * Attempt to parse and decrypt the VeraCrypt volume header.
  *
- * Tries PBKDF2-HMAC-SHA512 (500,000 iterations) + AES-256-XTS, which is the
- * most common VeraCrypt configuration. Returns 0 when the decrypted header
- * passes all integrity checks ("VERA" magic + two CRC-32 fields).
+ * Reads the first 512 bytes from fd, derives 64 bytes of key material via
+ * PBKDF2-HMAC-SHA512 (500,000 iterations), decrypts the header with
+ * AES-256-XTS, validates the "VERA" magic and both CRC-32 fields, then
+ * stores master keys + volume parameters in g_session for subsequent calls.
  *
- * @param headerBytes  First 512 bytes of the container (header sector).
- * @param password     UTF-8 passphrase bytes.
- * @return  0 = success, -1 = wrong password / unsupported algorithm, -2 = format error.
+ * @param fd       Open, readable file descriptor of the container.
+ * @param password UTF-8 passphrase bytes.
+ * @return 0 = success, -1 = wrong password / unsupported algorithm, -2 = I/O or format error.
  */
 JNIEXPORT jint JNICALL
 Java_io_veracrypt_android_corenative_NativeBridge_nativeParseHeader(
         JNIEnv *env,
         jclass /* clazz */,
-        jbyteArray headerBytes,
+        jint   jfd,
         jbyteArray password) {
 
-    if (headerBytes == nullptr || password == nullptr) {
-        LOGE("nativeParseHeader: null argument");
+    g_session.valid = false;
+
+    if (jfd < 0 || password == nullptr) {
+        LOGE("nativeParseHeader: invalid arguments");
         return -2;
     }
 
-    jsize headerLen = env->GetArrayLength(headerBytes);
-    if (headerLen < 512) {
-        LOGE("nativeParseHeader: header buffer too short (%d bytes)", (int)headerLen);
+    // Read first 512 bytes from the container
+    if (lseek64((int)jfd, 0, SEEK_SET) < 0) {
+        LOGE("nativeParseHeader: lseek failed");
         return -2;
     }
-    jsize pwdLen = env->GetArrayLength(password);
+    uint8_t hdr[512];
+    ssize_t nr = read((int)jfd, hdr, 512);
+    if (nr != 512) {
+        LOGE("nativeParseHeader: read only %zd bytes", nr);
+        return -2;
+    }
 
-    jbyte *hdr_j = env->GetByteArrayElements(headerBytes, nullptr);
-    jbyte *pwd_j = env->GetByteArrayElements(password,    nullptr);
-    if (!hdr_j || !pwd_j) {
-        if (hdr_j) env->ReleaseByteArrayElements(headerBytes, hdr_j, JNI_ABORT);
-        if (pwd_j) env->ReleaseByteArrayElements(password,    pwd_j, JNI_ABORT);
+    jsize  pwdLen = env->GetArrayLength(password);
+    jbyte* pwd_j  = env->GetByteArrayElements(password, nullptr);
+    if (!pwd_j) {
         LOGE("nativeParseHeader: GetByteArrayElements failed");
         return -2;
     }
+    const uint8_t* pwd = reinterpret_cast<const uint8_t*>(pwd_j);
 
-    const uint8_t *hdr = reinterpret_cast<const uint8_t*>(hdr_j);
-    const uint8_t *pwd = reinterpret_cast<const uint8_t*>(pwd_j);
-
-    // Salt: first 64 bytes
-    const uint8_t *salt = hdr;
-
-    // Derive 64 bytes of key material via PBKDF2-HMAC-SHA512 (500,000 iterations)
+    // Salt: first 64 bytes of the header
     uint8_t dk[64];
     LOGI("nativeParseHeader: deriving key (PBKDF2-SHA512, 500000 iter)…");
-    pbkdf2_sha512(pwd, (size_t)pwdLen, salt, 64, 500000u, dk, 64);
+    pbkdf2_sha512(pwd, (size_t)pwdLen, hdr, 64, 500000u, dk, 64);
 
-    // Decrypt the 448-byte encrypted block (header[64..511]) using AES-256-XTS
+    env->ReleaseByteArrayElements(password, pwd_j, JNI_ABORT);
+
+    // Decrypt the 448-byte encrypted block (header[64..511]) with AES-256-XTS, unit 0
     uint8_t plain[448];
-    aes256_xts_decrypt(dk, dk + 32, /*unit_no=*/0, hdr + 64, plain, 448);
-
-    env->ReleaseByteArrayElements(headerBytes, hdr_j, JNI_ABORT);
-    env->ReleaseByteArrayElements(password,    pwd_j, JNI_ABORT);
+    aes256_xts_decrypt(dk, dk + 32, 0u, hdr + 64, plain, 448);
 
     // Validate magic "VERA"
-    if (plain[0] != 'V' || plain[1] != 'E' || plain[2] != 'R' || plain[3] != 'A') {
-        LOGI("nativeParseHeader: magic mismatch (got %02x%02x%02x%02x)",
+    if (plain[0]!='V'||plain[1]!='E'||plain[2]!='R'||plain[3]!='A') {
+        LOGI("nativeParseHeader: magic mismatch (%02x%02x%02x%02x)",
              plain[0], plain[1], plain[2], plain[3]);
         return -1;
     }
 
-    // Validate CRC32 of header fields (decrypted[0..187]) stored at decrypted[188..191]
+    // Validate CRC32 of header fields (plain[0..187]) stored at plain[188..191]
     uint32_t crc_hdr_stored = ((uint32_t)plain[188]<<24)|((uint32_t)plain[189]<<16)|
                                ((uint32_t)plain[190]<< 8)| (uint32_t)plain[191];
     uint32_t crc_hdr_calc   = crc32_compute(plain, 188);
@@ -500,7 +812,7 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeParseHeader(
         return -1;
     }
 
-    // Validate CRC32 of master-keys area (decrypted[192..447]) stored at decrypted[8..11]
+    // Validate CRC32 of master-keys area (plain[192..447]) stored at plain[8..11]
     uint32_t crc_keys_stored = ((uint32_t)plain[8]<<24)|((uint32_t)plain[9]<<16)|
                                 ((uint32_t)plain[10]<<8)| (uint32_t)plain[11];
     uint32_t crc_keys_calc   = crc32_compute(plain + 192, 256);
@@ -510,8 +822,102 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeParseHeader(
         return -1;
     }
 
-    LOGI("nativeParseHeader: success – VeraCrypt header verified");
+    // Extract volume parameters from the decrypted header
+    uint64_t dataOffset = be64_read(plain + 44);
+    uint32_t sectorSize = ((uint32_t)plain[64]<<24)|((uint32_t)plain[65]<<16)|
+                          ((uint32_t)plain[66]<< 8)| (uint32_t)plain[67];
+    if (sectorSize == 0u || sectorSize > VC_MAX_SECTOR_SIZE) sectorSize = 512u;
+
+    // Populate session (master keys are at plain[192..255])
+    memcpy(g_session.masterKey1, plain + 192, 32);
+    memcpy(g_session.masterKey2, plain + 224, 32);
+    g_session.dataOffset = dataOffset;
+    g_session.sectorSize = sectorSize;
+    g_session.valid      = true;
+
+    LOGI("nativeParseHeader: success – dataOffset=%llu sectorSize=%u",
+         (unsigned long long)dataOffset, sectorSize);
     return 0;
+}
+
+/**
+ * List the files and sub-directories at `path` inside the container.
+ *
+ * nativeParseHeader must have returned 0 before calling this function.
+ * Reads FAT32 structures from fd using the master keys cached in g_session.
+ *
+ * @param fd    File descriptor of the container (same as passed to nativeParseHeader).
+ * @param path  Absolute path inside the container; currently only "/" is supported.
+ * @return jobjectArray of io.veracrypt.android.coreapi.VolumeEntry, or null on error.
+ */
+JNIEXPORT jobjectArray JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
+        JNIEnv *env,
+        jclass /* clazz */,
+        jint   jfd,
+        jstring jpath) {
+
+    if (!g_session.valid || jfd < 0) {
+        LOGE("nativeListDir: no valid session or bad fd");
+        return nullptr;
+    }
+
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) return nullptr;
+
+    Fat32Info fi;
+    bool bpbOk = fat32_read_bpb((int)jfd, &fi);
+    if (!bpbOk) {
+        env->ReleaseStringUTFChars(jpath, path);
+        LOGE("nativeListDir: failed to read FAT32 BPB");
+        return nullptr;
+    }
+
+    uint32_t dirCluster = fat32_find_dir(fi, path);
+    env->ReleaseStringUTFChars(jpath, path);
+
+    if (dirCluster < 2u) {
+        LOGE("nativeListDir: directory not found");
+        return nullptr;
+    }
+
+    std::vector<DirEntry> entries = fat32_list_cluster((int)jfd, fi, dirCluster);
+
+    // Build the Java VolumeEntry[] array
+    jclass     veClass = env->FindClass("io/veracrypt/android/coreapi/VolumeEntry");
+    if (!veClass) { LOGE("nativeListDir: VolumeEntry class not found"); return nullptr; }
+
+    jmethodID  initId  = env->GetMethodID(veClass, "<init>",
+                             "(Ljava/lang/String;Ljava/lang/String;ZJJ)V");
+    if (!initId)  { LOGE("nativeListDir: VolumeEntry constructor not found"); return nullptr; }
+
+    jobjectArray arr = env->NewObjectArray((jsize)entries.size(), veClass, nullptr);
+    if (!arr) return nullptr;
+
+    for (size_t i = 0; i < entries.size(); i++) {
+        const DirEntry& e = entries[i];
+
+        // Build the full path string (root children are /name)
+        std::string entryPath = "/" + e.name;
+
+        jstring jname  = env->NewStringUTF(e.name.c_str());
+        jstring jepath = env->NewStringUTF(entryPath.c_str());
+        jlong   lastMs = (jlong)fat_datetime_to_ms(e.modDate, e.modTime);
+
+        jobject obj = env->NewObject(veClass, initId,
+                          jname, jepath,
+                          (jboolean)(e.isDir ? JNI_TRUE : JNI_FALSE),
+                          (jlong)e.sizeBytes,
+                          lastMs);
+
+        env->SetObjectArrayElement(arr, (jsize)i, obj);
+        env->DeleteLocalRef(jname);
+        env->DeleteLocalRef(jepath);
+        env->DeleteLocalRef(obj);
+    }
+
+    LOGI("nativeListDir: returning %zu entries", entries.size());
+    return arr;
 }
 
 } // extern "C"

@@ -1,10 +1,12 @@
 package io.veracrypt.android.corenative
 
+import android.os.ParcelFileDescriptor
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
 
 /**
  * Instrumented test that validates [NativeBridge.nativeParseHeader] against a known-good
@@ -20,15 +22,24 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class NativeBridgeParseHeaderTest {
 
+    /**
+     * Copy the asset to a temporary file and return a read-only
+     * [ParcelFileDescriptor] so we can extract a raw int fd.
+     */
+    private fun assetToPfd(assetName: String): ParcelFileDescriptor {
+        val ctx  = InstrumentationRegistry.getInstrumentation().context
+        val tmp  = File(ctx.cacheDir, assetName)
+        ctx.assets.open(assetName).use { src -> tmp.outputStream().use { src.copyTo(it) } }
+        return ParcelFileDescriptor.open(tmp, ParcelFileDescriptor.MODE_READ_ONLY)
+    }
+
     @Test
     fun nativeParseHeader_returnsSuccess_forKnownContainer() {
-        val ctx = InstrumentationRegistry.getInstrumentation().context
-        val headerBytes = ctx.assets.open("test.vc").use { it.readBytes() }
-        assertEquals("test.vc must be exactly 512 bytes", 512, headerBytes.size)
-
+        val pfd      = assetToPfd("test.vc")
         val password = "test".toByteArray(Charsets.UTF_8)
+        val result   = NativeBridge.nativeParseHeader(pfd.fd, password)
+        pfd.close()
 
-        val result = NativeBridge.nativeParseHeader(headerBytes, password)
         assertEquals(
             "nativeParseHeader should return 0 (success) for the known container, got $result",
             0, result
@@ -37,11 +48,11 @@ class NativeBridgeParseHeaderTest {
 
     @Test
     fun nativeParseHeader_returnsWrongPassword_forBadPassword() {
-        val ctx = InstrumentationRegistry.getInstrumentation().context
-        val headerBytes = ctx.assets.open("test.vc").use { it.readBytes() }
+        val pfd      = assetToPfd("test.vc")
+        val password = "wrong_password".toByteArray(Charsets.UTF_8)
+        val result   = NativeBridge.nativeParseHeader(pfd.fd, password)
+        pfd.close()
 
-        val wrongPassword = "wrong_password".toByteArray(Charsets.UTF_8)
-        val result = NativeBridge.nativeParseHeader(headerBytes, wrongPassword)
         assertEquals(
             "nativeParseHeader should return -1 (wrong password) for incorrect passphrase",
             -1, result
