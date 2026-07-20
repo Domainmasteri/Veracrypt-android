@@ -3,4 +3,12 @@
     <string name="btn_open_container">Open Container…</string>
     <string name="status_idle">No container selected.</string>
     <string name="status_selected">Selected: %1$s</string>
+    <string name="password_dialog_title">Enter password</string>
+    <string name="password_hint">Password</string>
+    <string name="status_opening">Opening container…</string>
+    <string name="status_header_ok">Header decrypted successfully.</string>
+    <string name="status_mounted">Container mounted – open the file manager to browse files.</string>
+    <string name="status_wrong_password">Wrong password.</string>
+    <string name="status_error_open">Could not open the file.</string>
+    <string name="status_error_format">Unrecognised container format.</string>
 </resources>

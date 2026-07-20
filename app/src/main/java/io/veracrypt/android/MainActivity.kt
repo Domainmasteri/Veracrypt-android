@@ -2,19 +2,41 @@ package io.veracrypt.android
 
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.text.InputType
+import android.util.Log
+import android.widget.EditText
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import io.veracrypt.android.corenative.NativeBridge
 import io.veracrypt.android.databinding.ActivityMainBinding
+import io.veracrypt.android.providersaf.VeraCryptDocumentsProvider
+
+private const val TAG = "MainActivity"
 
 /**
  * Main entry point of the VeraCrypt Android read-only MVP.
  *
  * Allows the user to pick a VeraCrypt container file via the Storage Access
- * Framework and hands it off to the native bridge for header parsing.
+ * Framework, prompts for the password, then passes the raw file descriptor and
+ * password to the native bridge for header decryption.
+ *
+ * On success the [ParcelFileDescriptor] is kept open and transferred to
+ * [VeraCryptDocumentsProvider] so that the SAF file browser can list entries
+ * inside the container.  The PFD is closed when [onDestroy] is called or when
+ * a new container is successfully opened.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+
+    /**
+     * The PFD of the currently mounted container.
+     * Ownership is shared with [VeraCryptDocumentsProvider]; it is closed by
+     * [VeraCryptDocumentsProvider.unmount] (called from [onDestroy]).
+     */
+    private var containerPfd: ParcelFileDescriptor? = null
 
     private val pickContainer = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -34,8 +56,78 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        // unmount() closes the PFD owned by the provider; clear our reference.
+        VeraCryptDocumentsProvider.unmount()
+        containerPfd = null
+    }
+
     private fun onContainerSelected(uri: Uri) {
         binding.tvStatus.text = getString(R.string.status_selected, uri.lastPathSegment ?: uri.toString())
-        // TODO: pass URI to NativeBridge for VeraCrypt header parsing
+        showPasswordDialog(uri)
+    }
+
+    private fun showPasswordDialog(uri: Uri) {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            hint = getString(R.string.password_hint)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.password_dialog_title)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val password = input.text.toString().toByteArray(Charsets.UTF_8)
+                openContainerWithPassword(uri, password)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun openContainerWithPassword(uri: Uri, password: ByteArray) {
+        binding.tvStatus.text = getString(R.string.status_opening)
+        binding.btnOpenContainer.isEnabled = false
+
+        Thread {
+            var pfd: ParcelFileDescriptor? = null
+            var result = Int.MIN_VALUE
+
+            try {
+                pfd = contentResolver.openFileDescriptor(uri, "r")
+                if (pfd != null) {
+                    result = NativeBridge.nativeParseHeader(pfd.fd, password)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error opening container", e)
+                pfd?.close()
+                pfd = null
+            }
+
+            // On failure, close the PFD immediately; on success hand it off to the provider.
+            if (result != 0) {
+                pfd?.close()
+                pfd = null
+            }
+
+            val successPfd = pfd // non-null only when result == 0
+
+            runOnUiThread {
+                binding.btnOpenContainer.isEnabled = true
+
+                if (successPfd != null) {
+                    // Transfer PFD ownership to the provider (closes any previously mounted one)
+                    containerPfd = successPfd
+                    VeraCryptDocumentsProvider.mount(successPfd)
+                    binding.tvStatus.text = getString(R.string.status_mounted)
+                } else {
+                    binding.tvStatus.text = when (result) {
+                        -1            -> getString(R.string.status_wrong_password)
+                        Int.MIN_VALUE -> getString(R.string.status_error_open)
+                        else          -> getString(R.string.status_error_format)
+                    }
+                }
+            }
+        }.start()
     }
 }
+
