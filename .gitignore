@@ -1,0 +1,49 @@
+*.iml
+.gradle
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Kotlin
+*.class
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Generated files
+bin/
+gen/
+out/
+release/
+
+# Gradle files
+.gradle/
+build/
+
+# Android Studio
+*.iws
+*.ipr
+*.iml
+.idea/
+
+# NDK
+obj/
+libs/
+jni/libs/
+
+# Keystore files
+*.jks
+*.keystore
+
+# Compiled files
+*.apk
+*.ap_
+*.dex
