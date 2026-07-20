@@ -497,8 +497,9 @@ struct DirEntry {
     std::string name;
     bool        isDir;
     uint32_t    sizeBytes;
-    uint16_t    modDate;  // FAT date encoding
-    uint16_t    modTime;  // FAT time encoding
+    uint16_t    modDate;      // FAT date encoding
+    uint16_t    modTime;      // FAT time encoding
+    uint32_t    firstCluster; // starting FAT cluster of this entry's data
 };
 
 // Convert a UCS-2LE code point to UTF-8; returns number of bytes written (1-3).
@@ -705,12 +706,13 @@ static std::vector<DirEntry> fat32_list_cluster(int fd, const Fat32Info& fi,
                 if (name == "." || name == "..") continue;
                 if (name.empty()) continue;
 
-                bool     isDir = (attr & 0x10u) != 0u;
-                uint32_t fsize = le32r(ent + 28);
-                uint16_t mdate = le16r(ent + 24);
-                uint16_t mtime = le16r(ent + 22);
+                bool     isDir        = (attr & 0x10u) != 0u;
+                uint32_t fsize        = le32r(ent + 28);
+                uint16_t mdate        = le16r(ent + 24);
+                uint16_t mtime        = le16r(ent + 22);
+                uint32_t firstCluster = ((uint32_t)le16r(ent + 20) << 16) | (uint32_t)le16r(ent + 26);
 
-                results.push_back({name, isDir, fsize, mdate, mtime});
+                results.push_back({name, isDir, fsize, mdate, mtime, firstCluster});
             }
         }
 
@@ -854,6 +856,7 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
     int      nameLength    = 0;
     uint64_t dataLength    = 0;
     bool     haveStream    = false;
+    uint32_t streamCluster = 0;
     std::string pendingName;
 
     uint32_t cluster  = startCluster;
@@ -878,7 +881,7 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                 // Not-in-use (bit 7 clear = deleted / free); reset any pending record
                 if ((type & 0x80u) == 0u) {
                     haveFile = false; haveStream = false;
-                    secondaryRead = 0; pendingName.clear();
+                    secondaryRead = 0; streamCluster = 0; pendingName.clear();
                     continue;
                 }
 
@@ -892,9 +895,10 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                     modDate = (uint16_t)(ts >> 16);
                     modTime = (uint16_t)(ts & 0xFFFFu);
                     pendingName.clear();
-                    dataLength = 0;
-                    haveFile   = true;
-                    haveStream = false;
+                    dataLength    = 0;
+                    streamCluster = 0;
+                    haveFile      = true;
+                    haveStream    = false;
                     secondaryRead = 0;
                     continue;
                 }
@@ -905,10 +909,11 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                 secondaryRead++;
 
                 if (type == 0xC0u && !haveStream) {
-                    // Stream Extension: name length + data length
-                    nameLength = (int)ent[3]; // NameLength
-                    dataLength = le64r(ent + 24); // DataLength
-                    haveStream = true;
+                    // Stream Extension: name length + data length + first cluster
+                    nameLength    = (int)ent[3]; // NameLength
+                    dataLength    = le64r(ent + 24); // DataLength
+                    streamCluster = le32r(ent + 20); // FirstCluster
+                    haveStream    = true;
                 } else if (type == 0xC1u) {
                     // File Name entry: up to 15 UCS-2LE characters at bytes 2-31
                     for (int c = 0; c < 15; c++) {
@@ -929,10 +934,10 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                         uint32_t sz = (dataLength > 0xFFFFFFFFu)
                                         ? 0xFFFFFFFFu
                                         : (uint32_t)dataLength;
-                        results.push_back({pendingName, isDir, sz, modDate, modTime});
+                        results.push_back({pendingName, isDir, sz, modDate, modTime, streamCluster});
                     }
                     haveFile = false; haveStream = false;
-                    secondaryRead = 0; pendingName.clear();
+                    secondaryRead = 0; streamCluster = 0; pendingName.clear();
                 }
             }
         }
@@ -955,6 +960,183 @@ static uint32_t exfat_find_dir(const ExFatInfo& ei, const char* path) {
     }
     LOGE("exfat_find_dir: sub-directory navigation not yet implemented (%s)", path);
     return 0u;
+}
+
+// ============================================================
+// Path utilities and file-reading helpers
+// ============================================================
+
+// Split an absolute path like "/dir/sub/file.txt" into ["dir", "sub", "file.txt"].
+static std::vector<std::string> split_path(const std::string& path) {
+    std::vector<std::string> parts;
+    size_t start = (!path.empty() && path[0] == '/') ? 1u : 0u;
+    while (start < path.size()) {
+        size_t end = path.find('/', start);
+        if (end == std::string::npos) end = path.size();
+        if (end > start) parts.push_back(path.substr(start, end - start));
+        start = end + 1;
+    }
+    return parts;
+}
+
+// Find the DirEntry for the file at `path` inside a FAT32 filesystem.
+// Returns true and fills `out` on success; false if not found or path is a directory.
+static bool fat32_find_file(int fd, const Fat32Info& fi,
+                             const char* path, DirEntry& out) {
+    if (!path || path[0] == '\0') return false;
+    auto parts = split_path(std::string(path));
+    if (parts.empty()) return false;
+
+    uint32_t cluster = fi.rootCluster;
+    for (size_t i = 0; i < parts.size(); i++) {
+        auto entries = fat32_list_cluster(fd, fi, cluster);
+        bool found = false;
+        for (auto& e : entries) {
+            if (e.name == parts[i]) {
+                if (i == parts.size() - 1) {
+                    if (e.isDir) return false; // path points to a directory
+                    out = e;
+                    return true;
+                }
+                if (!e.isDir) return false; // expected a directory
+                cluster = e.firstCluster;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return false;
+}
+
+// Read up to `length` bytes from a FAT32 file starting at byte `offset`.
+// Returns the number of bytes actually read, 0 at EOF, or -1 on I/O error.
+static ssize_t fat32_read_file_data(int fd, const Fat32Info& fi,
+                                     const DirEntry& entry,
+                                     uint64_t offset, uint8_t* buf, int length) {
+    if (length <= 0 || entry.firstCluster < 2u || offset >= (uint64_t)entry.sizeBytes)
+        return 0;
+
+    int64_t toRead = (int64_t)std::min((uint64_t)length,
+                                        (uint64_t)entry.sizeBytes - offset);
+    uint32_t clusterBytes = (uint32_t)fi.sectorsPerCluster * g_session.sectorSize;
+
+    // Advance to the cluster that contains `offset`
+    uint64_t clusterIdx = offset / clusterBytes;
+    uint32_t cluster    = entry.firstCluster;
+    for (uint64_t i = 0; i < clusterIdx; i++) {
+        cluster = fat32_next_cluster(fd, fi, cluster);
+        if (cluster >= 0x0FFFFFF8u) return 0;
+    }
+
+    uint64_t offsetInCluster = offset % clusterBytes;
+    ssize_t  totalRead       = 0;
+
+    while (toRead > 0 && cluster >= 2u && cluster < 0x0FFFFFF8u) {
+        uint32_t firstSec = fat32_cluster_to_sector(fi, cluster);
+        uint32_t secIdx   = (uint32_t)(offsetInCluster / g_session.sectorSize);
+        uint32_t offInSec = (uint32_t)(offsetInCluster % g_session.sectorSize);
+
+        while (toRead > 0 && secIdx < (uint32_t)fi.sectorsPerCluster) {
+            uint8_t sec[VC_MAX_SECTOR_SIZE];
+            if (!vc_read_sector(fd, firstSec + secIdx, sec)) {
+                return totalRead > 0 ? totalRead : -1;
+            }
+            int32_t copyLen = (int32_t)std::min((int64_t)(g_session.sectorSize - offInSec), toRead);
+            memcpy(buf + totalRead, sec + offInSec, (size_t)copyLen);
+            totalRead += copyLen;
+            toRead    -= copyLen;
+            offInSec   = 0;
+            secIdx++;
+        }
+
+        offsetInCluster = 0;
+        if (toRead > 0) cluster = fat32_next_cluster(fd, fi, cluster);
+    }
+
+    return totalRead;
+}
+
+// Find the DirEntry for the file at `path` inside an exFAT filesystem.
+// Returns true and fills `out` on success; false if not found or path is a directory.
+static bool exfat_find_file(int fd, const ExFatInfo& ei,
+                              const char* path, DirEntry& out) {
+    if (!path || path[0] == '\0') return false;
+    auto parts = split_path(std::string(path));
+    if (parts.empty()) return false;
+
+    uint32_t cluster = ei.rootCluster;
+    for (size_t i = 0; i < parts.size(); i++) {
+        auto entries = exfat_list_cluster(fd, ei, cluster);
+        bool found = false;
+        for (auto& e : entries) {
+            if (e.name == parts[i]) {
+                if (i == parts.size() - 1) {
+                    if (e.isDir) return false;
+                    out = e;
+                    return true;
+                }
+                if (!e.isDir) return false;
+                cluster = e.firstCluster;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return false;
+}
+
+// Read up to `length` bytes from an exFAT file starting at byte `offset`.
+// Returns the number of bytes actually read, 0 at EOF, or -1 on I/O error.
+static ssize_t exfat_read_file_data(int fd, const ExFatInfo& ei,
+                                     const DirEntry& entry,
+                                     uint64_t offset, uint8_t* buf, int length) {
+    if (length <= 0 || entry.firstCluster < 2u || offset >= (uint64_t)entry.sizeBytes)
+        return 0;
+
+    int64_t toRead = (int64_t)std::min((uint64_t)length,
+                                        (uint64_t)entry.sizeBytes - offset);
+    uint32_t clusterBytes = ei.sectorsPerCluster * (uint32_t)ei.bytesPerSector;
+
+    // Advance to the cluster that contains `offset`
+    uint64_t clusterIdx = offset / clusterBytes;
+    uint32_t cluster    = entry.firstCluster;
+    for (uint64_t i = 0; i < clusterIdx; i++) {
+        cluster = exfat_next_cluster(fd, ei, cluster);
+        if (cluster >= 0xFFFFFFF8u) return 0;
+    }
+
+    uint64_t offsetInCluster = offset % clusterBytes;
+    ssize_t  totalRead       = 0;
+
+    while (toRead > 0 && cluster >= 2u && cluster < 0xFFFFFFF8u) {
+        uint64_t firstSec = exfat_cluster_to_sector(ei, cluster);
+        uint32_t secIdx   = (uint32_t)(offsetInCluster / ei.bytesPerSector);
+        uint32_t offInSec = (uint32_t)(offsetInCluster % ei.bytesPerSector);
+
+        while (toRead > 0 && secIdx < ei.sectorsPerCluster) {
+            uint8_t sec[VC_MAX_SECTOR_SIZE];
+            if (!vc_read_sector(fd, firstSec + secIdx, sec)) {
+                return totalRead > 0 ? totalRead : -1;
+            }
+            int32_t copyLen = (int32_t)std::min((int64_t)((uint32_t)ei.bytesPerSector - offInSec), toRead);
+            memcpy(buf + totalRead, sec + offInSec, (size_t)copyLen);
+            totalRead += copyLen;
+            toRead    -= copyLen;
+            offInSec   = 0;
+            secIdx++;
+        }
+
+        offsetInCluster = 0;
+        if (toRead > 0) {
+            uint32_t next = exfat_next_cluster(fd, ei, cluster);
+            if (next >= 0xFFFFFFF8u) break;
+            cluster = next;
+        }
+    }
+
+    return totalRead;
 }
 
 // ============================================================
@@ -1173,6 +1355,92 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
     LOGI("nativeListDir: returning %zu entries (fs=%s)",
          entries.size(), fsType == FS_FAT32 ? "FAT32" : "exFAT");
     return arr;
+}
+
+/**
+ * Read up to `length` bytes from the file at `path` inside the currently open
+ * container, starting at byte offset `offset`.
+ *
+ * nativeParseHeader must have returned 0 before calling this function.
+ * The data is decrypted on-the-fly with AES-256-XTS using the master keys
+ * cached in g_session.
+ *
+ * @param fd      File descriptor of the container.
+ * @param path    Absolute path of the file inside the container (e.g. "/report.pdf").
+ * @param offset  Byte offset within the file to start reading from (>= 0).
+ * @param length  Maximum number of bytes to read; capped internally at 4 MiB.
+ * @return        jbyteArray with the bytes read (may be shorter than `length` at EOF),
+ *                an empty array at EOF, or null if the file is not found or on I/O error.
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_io_veracrypt_android_corenative_NativeBridge_nativeReadFile(
+        JNIEnv *env,
+        jclass /* clazz */,
+        jint   jfd,
+        jstring jpath,
+        jlong  offset,
+        jint   length) {
+
+    if (!g_session.valid || jfd < 0 || jpath == nullptr || length <= 0 || offset < 0) {
+        LOGE("nativeReadFile: invalid arguments");
+        return nullptr;
+    }
+
+    // Cap per-call allocation at 4 MiB to avoid OOM in the JNI layer
+    if (length > 4 * 1024 * 1024) length = 4 * 1024 * 1024;
+
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) return nullptr;
+
+    FsType fsType = detect_filesystem((int)jfd);
+    DirEntry entry;
+    bool     found = false;
+    ssize_t  n     = -1;
+
+    std::vector<uint8_t> buf((size_t)length);
+
+    if (fsType == FS_FAT32) {
+        Fat32Info fi;
+        if (fat32_read_bpb((int)jfd, &fi)) {
+            found = fat32_find_file((int)jfd, fi, path, entry);
+            if (found) {
+                n = fat32_read_file_data((int)jfd, fi, entry, (uint64_t)offset,
+                                         buf.data(), length);
+            }
+        }
+    } else if (fsType == FS_EXFAT) {
+        ExFatInfo ei;
+        if (exfat_read_bpb((int)jfd, &ei)) {
+            found = exfat_find_file((int)jfd, ei, path, entry);
+            if (found) {
+                n = exfat_read_file_data((int)jfd, ei, entry, (uint64_t)offset,
+                                          buf.data(), length);
+            }
+        }
+    }
+
+    env->ReleaseStringUTFChars(jpath, path);
+
+    if (!found) {
+        LOGE("nativeReadFile: file not found");
+        return nullptr;
+    }
+    if (n < 0) {
+        LOGE("nativeReadFile: I/O error while reading");
+        return nullptr;
+    }
+
+    jbyteArray result = env->NewByteArray((jsize)n);
+    if (!result) {
+        LOGE("nativeReadFile: NewByteArray failed for %zd bytes", n);
+        return nullptr;
+    }
+    if (n > 0) {
+        env->SetByteArrayRegion(result, 0, (jsize)n,
+                                reinterpret_cast<const jbyte*>(buf.data()));
+    }
+    LOGI("nativeReadFile: read %zd bytes at offset %lld", n, (long long)offset);
+    return result;
 }
 
 } // extern "C"

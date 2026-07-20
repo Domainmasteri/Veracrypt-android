@@ -49,6 +49,23 @@ object NativeBridge {
     @JvmStatic
     external fun nativeListDir(fd: Int, path: String): Array<VolumeEntry>?
 
+    /**
+     * Read up to [length] bytes from the file at [path] inside the currently
+     * open container, starting at byte [offset].
+     *
+     * [nativeParseHeader] must have returned 0 before calling this function.
+     * Data is decrypted on-the-fly with AES-256-XTS.
+     *
+     * @param fd     File descriptor of the container.
+     * @param path   Absolute path inside the container, e.g. "/documents/report.pdf".
+     * @param offset Byte offset within the file to start reading from.
+     * @param length Maximum number of bytes to read (capped at 4 MiB internally).
+     * @return The bytes read (may be fewer than [length] at end-of-file),
+     *         an empty array at EOF, or null if the file is not found or on I/O error.
+     */
+    @JvmStatic
+    external fun nativeReadFile(fd: Int, path: String, offset: Long, length: Int): ByteArray?
+
     /** Convenience: returns the native library version. */
     fun version(): String = nativeGetVersion()
 }

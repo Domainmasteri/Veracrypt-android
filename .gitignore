@@ -11,7 +11,6 @@ local.properties
 
 # Kotlin
 *.class
-*.jar
 *.war
 *.ear
 *.zip

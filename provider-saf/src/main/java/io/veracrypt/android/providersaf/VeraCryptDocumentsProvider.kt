@@ -175,8 +175,52 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         if (mode != "r") {
             throw UnsupportedOperationException("VeraCryptDocumentsProvider is read-only")
         }
-        // TODO: return a ParcelFileDescriptor backed by NativeBridge reads
-        throw UnsupportedOperationException("openDocument not yet implemented")
+        val fd = mountedFd
+        if (fd < 0) {
+            throw IllegalStateException("No VeraCrypt container is currently mounted")
+        }
+
+        // Use the cached file size when available so we can terminate the loop exactly.
+        val fileSize = entryCache[documentId]?.sizeBytes ?: -1L
+
+        val pipes     = ParcelFileDescriptor.createReliablePipe()
+        val readEnd   = pipes[0]
+        val writeEnd  = pipes[1]
+
+        val thread = Thread {
+            try {
+                ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
+                    val chunkSize = 65536 // 64 KiB per native call
+                    var offset    = 0L
+                    while (true) {
+                        if (signal?.isCanceled == true) break
+
+                        val toRead: Int = if (fileSize > 0L) {
+                            minOf(chunkSize.toLong(), fileSize - offset).toInt()
+                        } else {
+                            chunkSize
+                        }
+                        if (toRead <= 0) break
+
+                        val chunk = NativeBridge.nativeReadFile(fd, documentId, offset, toRead)
+                        if (chunk == null || chunk.isEmpty()) break
+
+                        out.write(chunk)
+                        offset += chunk.size
+
+                        if (chunk.size < toRead) break // native signalled EOF
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "openDocument: error streaming $documentId", e)
+                // writeEnd is closed by AutoCloseOutputStream.use{}
+            }
+        }
+        thread.isDaemon = true
+        thread.name = "veracrypt-read-${documentId.substringAfterLast('/')}"
+        thread.start()
+
+        return readEnd
     }
 
     // -------------------------------------------------------------------------
