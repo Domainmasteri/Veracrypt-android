@@ -75,8 +75,9 @@ class ContainerViewerProvider : ContentProvider() {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
                     var offset = 0L
                     while (true) {
-                        val toRead = if (expectedSize > 0L) {
-                            minOf(CHUNK_SIZE.toLong(), expectedSize - offset).toInt()
+                        val remaining = expectedSize?.minus(offset)
+                        val toRead = if (remaining != null && remaining > 0L) {
+                            minOf(CHUNK_SIZE.toLong(), remaining).toInt()
                         } else {
                             CHUNK_SIZE
                         }
