@@ -31,6 +31,26 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/tv_title" />
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn_create_container"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="@string/btn_create_container"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/btn_open_container" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn_root_mount"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="@string/btn_root_mount"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/btn_create_container" />
+
     <TextView
         android:id="@+id/tv_status"
         android:layout_width="0dp"
@@ -42,6 +62,6 @@
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@+id/btn_open_container" />
+        app:layout_constraintTop_toBottomOf="@+id/btn_root_mount" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
