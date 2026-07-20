@@ -55,6 +55,8 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
         /** Synthetic document ID representing the root of the container file system. */
         private const val ROOT_DOCUMENT_ID = "/"
+        private const val FS_FAT32 = 1
+        private const val FS_EXFAT = 2
 
         /** The open [ParcelFileDescriptor] passed to [mount].  Owned by this provider. */
         @Volatile
@@ -144,6 +146,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         val fd = mountedFd
         if (fd < 0) return result
+        val writableFs = supportsWrite(fd)
 
         try {
             val entries = NativeBridge.nativeListDir(fd, parentDocumentId) ?: return result
@@ -157,7 +160,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                     add(Document.COLUMN_LAST_MODIFIED, entry.lastModifiedMs.takeIf { it > 0L })
                     add(
                         Document.COLUMN_FLAGS,
-                        if (entry.isDirectory) 0 else
+                        if (entry.isDirectory || !writableFs) 0 else
                             Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE
                     )
                     add(Document.COLUMN_SIZE,
@@ -185,6 +188,9 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         val fileSize = entryCache[documentId]?.sizeBytes ?: -1L
 
         val writable = mode.contains("w")
+        if (writable && !supportsWrite(fd)) {
+            throw UnsupportedOperationException("Write is not supported for this filesystem")
+        }
         val pipes = if (writable) {
             ParcelFileDescriptor.createPipe()
         } else {
@@ -254,6 +260,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
     /** Add a row built from a cached [VolumeEntry]. */
     private fun addEntryRow(cursor: MatrixCursor, entry: VolumeEntry) {
+        val writableFs = mountedFd >= 0 && supportsWrite(mountedFd)
         cursor.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID,   entry.path)
             add(Document.COLUMN_MIME_TYPE,
@@ -262,7 +269,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             add(Document.COLUMN_LAST_MODIFIED, entry.lastModifiedMs.takeIf { it > 0L })
             add(
                 Document.COLUMN_FLAGS,
-                if (entry.isDirectory) 0 else
+                if (entry.isDirectory || !writableFs) 0 else
                     Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE
             )
             add(Document.COLUMN_SIZE,
@@ -282,6 +289,13 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             add(Document.COLUMN_LAST_MODIFIED, null)
             add(Document.COLUMN_FLAGS,         0)
             add(Document.COLUMN_SIZE,          null)
+        }
+    }
+
+    private fun supportsWrite(fd: Int): Boolean {
+        return when (NativeBridge.nativeGetFileSystemType(fd)) {
+            FS_FAT32, FS_EXFAT -> true
+            else -> false
         }
     }
 }

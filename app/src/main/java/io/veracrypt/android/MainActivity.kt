@@ -140,113 +140,118 @@ class MainActivity : AppCompatActivity() {
                         Int.MIN_VALUE -> getString(R.string.status_error_open)
                         else          -> getString(R.string.status_error_format)
                     }
-
-                    private fun showCreateContainerDialog(uri: Uri) {
-                        val layout = LinearLayout(this).apply {
-                            orientation = LinearLayout.VERTICAL
-                            setPadding(48, 16, 48, 0)
-                        }
-                        val sizeInput = EditText(this).apply {
-                            inputType = InputType.TYPE_CLASS_NUMBER
-                            hint = getString(R.string.create_size_hint_mb)
-                            setText("128")
-                        }
-                        val passwordInput = EditText(this).apply {
-                            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                            hint = getString(R.string.create_password_hint)
-                        }
-                        val fsInput = EditText(this).apply {
-                            hint = getString(R.string.create_fs_hint)
-                            setText("FAT32")
-                        }
-                        layout.addView(sizeInput)
-                        layout.addView(passwordInput)
-                        layout.addView(fsInput)
-
-                        AlertDialog.Builder(this)
-                            .setTitle(R.string.create_dialog_title)
-                            .setView(layout)
-                            .setPositiveButton(android.R.string.ok) { _, _ ->
-                                val sizeMb = sizeInput.text.toString().toLongOrNull() ?: 0L
-                                val password = passwordInput.text.toString().toByteArray(Charsets.UTF_8)
-                                val fsType = when (fsInput.text.toString().trim().uppercase()) {
-                                    "FAT32" -> 1
-                                    "EXFAT" -> 2
-                                    "NTFS" -> 3
-                                    else -> 1
-                                }
-                                createNewContainer(uri, password, sizeMb * 1024L * 1024L, fsType)
-                            }
-                            .setNegativeButton(android.R.string.cancel, null)
-                            .show()
-                    }
-
-                    private fun createNewContainer(uri: Uri, password: ByteArray, sizeBytes: Long, fsType: Int) {
-                        binding.tvStatus.text = getString(R.string.status_opening)
-                        Thread {
-                            val result = try {
-                                contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
-                                    val entropy = ByteArray(64).also {
-                                        java.security.SecureRandom().nextBytes(it)
-                                    }
-                                    NativeBridge.nativeCreateContainer(
-                                        pfd.fd,
-                                        password,
-                                        entropy,
-                                        sizeBytes,
-                                        fsType
-                                    )
-                                } ?: -1
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Container creation failed", e)
-                                -1
-                            }
-
-                            runOnUiThread {
-                                binding.tvStatus.text = if (result == 0) {
-                                    getString(R.string.status_create_success)
-                                } else {
-                                    getString(R.string.status_create_failed)
-                                }
-                            }
-                        }.start()
-                    }
-
-                    private fun showRootMountDialog() {
-                        val input = EditText(this).apply {
-                            hint = getString(R.string.root_mount_hint)
-                            setText("/mnt/veracrypt/main")
-                        }
-                        AlertDialog.Builder(this)
-                            .setTitle(R.string.root_mount_title)
-                            .setView(input)
-                            .setPositiveButton(android.R.string.ok) { _, _ ->
-                                val pfd = containerPfd ?: run {
-                                    binding.tvStatus.text = getString(R.string.status_error_open)
-                                    return@setPositiveButton
-                                }
-                                Thread {
-                                    val mountPoint = input.text.toString()
-                                    val result = NativeBridge.nativePrepareFuseMount(
-                                        pfd.fd,
-                                        mountPoint,
-                                        true
-                                    )
-                                    val rootReady = if (result == 0) RootFuseManager.prepareMountPoint(mountPoint) else false
-                                    runOnUiThread {
-                                        binding.tvStatus.text = if (result == 0 && rootReady) {
-                                            getString(R.string.status_mount_ready)
-                                        } else {
-                                            getString(R.string.status_write_failed)
-                                        }
-                                    }
-                                }.start()
-                            }
-                            .setNegativeButton(android.R.string.cancel, null)
-                            .show()
-                    }
                 }
             }
         }.start()
+    }
+
+    private fun showCreateContainerDialog(uri: Uri) {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 0)
+        }
+        val sizeInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = getString(R.string.create_size_hint_mb)
+            setText("128")
+        }
+        val passwordInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            hint = getString(R.string.create_password_hint)
+        }
+        val fsInput = EditText(this).apply {
+            hint = getString(R.string.create_fs_hint)
+            setText("FAT32")
+        }
+        layout.addView(sizeInput)
+        layout.addView(passwordInput)
+        layout.addView(fsInput)
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.create_dialog_title)
+            .setView(layout)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val sizeMb = sizeInput.text.toString().toLongOrNull() ?: 0L
+                val password = passwordInput.text.toString().toByteArray(Charsets.UTF_8)
+                val fsTypeText = fsInput.text.toString().trim().uppercase()
+                val fsType = when (fsTypeText) {
+                    "FAT32" -> 1
+                    "EXFAT" -> 2
+                    "NTFS" -> 3
+                    else -> {
+                        binding.tvStatus.text = getString(R.string.status_invalid_fs)
+                        return@setPositiveButton
+                    }
+                }
+                createNewContainer(uri, password, sizeMb * 1024L * 1024L, fsType)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun createNewContainer(uri: Uri, password: ByteArray, sizeBytes: Long, fsType: Int) {
+        binding.tvStatus.text = getString(R.string.status_opening)
+        Thread {
+            val result = try {
+                contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                    val entropy = ByteArray(64).also {
+                        java.security.SecureRandom().nextBytes(it)
+                    }
+                    NativeBridge.nativeCreateContainer(
+                        pfd.fd,
+                        password,
+                        entropy,
+                        sizeBytes,
+                        fsType
+                    )
+                } ?: -1
+            } catch (e: Exception) {
+                Log.e(TAG, "Container creation failed", e)
+                -1
+            }
+
+            runOnUiThread {
+                binding.tvStatus.text = if (result == 0) {
+                    if (fsType == 3) getString(R.string.status_ntfs_limited)
+                    else getString(R.string.status_create_success)
+                } else {
+                    getString(R.string.status_create_failed)
+                }
+            }
+        }.start()
+    }
+
+    private fun showRootMountDialog() {
+        val input = EditText(this).apply {
+            hint = getString(R.string.root_mount_hint)
+            setText("/mnt/veracrypt/main")
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.root_mount_title)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val pfd = containerPfd ?: run {
+                    binding.tvStatus.text = getString(R.string.status_error_open)
+                    return@setPositiveButton
+                }
+                Thread {
+                    val mountPoint = input.text.toString()
+                    val result = NativeBridge.nativePrepareFuseMount(
+                        pfd.fd,
+                        mountPoint,
+                        true
+                    )
+                    val rootReady = if (result == 0) RootFuseManager.prepareMountPoint(mountPoint) else false
+                    runOnUiThread {
+                        binding.tvStatus.text = if (result == 0 && rootReady) {
+                            getString(R.string.status_mount_ready)
+                        } else {
+                            getString(R.string.status_write_failed)
+                        }
+                    }
+                }.start()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 }

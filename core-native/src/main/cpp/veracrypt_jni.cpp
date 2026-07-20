@@ -1752,6 +1752,7 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
     DirEntry entry;
     bool found = false;
     bool ok = false;
+    bool unsupportedFsOp = false;
     uint64_t writeEnd = (uint64_t)offset + (uint64_t)dataLen;
     uint16_t modDate = 0;
     uint16_t modTime = 0;
@@ -1776,12 +1777,12 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
             if (found) ok = exfat_write_file_data((int)jfd, ei, entry, (uint64_t)offset, buf.data(), dataLen);
         }
     } else if (fsType == FS_NTFS) {
-        // NTFS MFT mutation is intentionally blocked until full metadata journaling is integrated.
-        found = true;
-        ok = false;
+        // NTFS mutation remains disabled until journaling/metadata updates are fully implemented.
+        unsupportedFsOp = true;
     }
 
     env->ReleaseStringUTFChars(jpath, path);
+    if (unsupportedFsOp) return -2;
     if (!found) return -2;
     if (!ok) return -3;
     return dataLen;

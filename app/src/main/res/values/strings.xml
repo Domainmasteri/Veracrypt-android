@@ -16,6 +16,8 @@
     <string name="status_write_failed">Write operation failed.</string>
     <string name="status_create_success">Container created successfully.</string>
     <string name="status_create_failed">Container creation failed.</string>
+    <string name="status_ntfs_limited">NTFS container created. Use root/FUSE mount for full NTFS access.</string>
+    <string name="status_invalid_fs">Invalid filesystem. Use FAT32, exFAT, or NTFS.</string>
     <string name="status_mount_ready">Root mount metadata prepared.</string>
     <string name="create_dialog_title">Create new container</string>
     <string name="create_size_hint_mb">Size in MB</string>
