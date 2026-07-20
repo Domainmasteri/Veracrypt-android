@@ -35,6 +35,7 @@ android {
 
 dependencies {
     implementation(project(":core-api"))
+    implementation(project(":core-native"))
     implementation(libs.androidx.core.ktx)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

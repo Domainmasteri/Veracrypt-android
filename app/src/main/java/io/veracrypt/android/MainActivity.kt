@@ -4,12 +4,16 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.text.InputType
+import android.util.Log
 import android.widget.EditText
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import io.veracrypt.android.corenative.NativeBridge
 import io.veracrypt.android.databinding.ActivityMainBinding
+import io.veracrypt.android.providersaf.VeraCryptDocumentsProvider
+
+private const val TAG = "MainActivity"
 
 /**
  * Main entry point of the VeraCrypt Android read-only MVP.
@@ -17,10 +21,22 @@ import io.veracrypt.android.databinding.ActivityMainBinding
  * Allows the user to pick a VeraCrypt container file via the Storage Access
  * Framework, prompts for the password, then passes the raw file descriptor and
  * password to the native bridge for header decryption.
+ *
+ * On success the [ParcelFileDescriptor] is kept open and transferred to
+ * [VeraCryptDocumentsProvider] so that the SAF file browser can list entries
+ * inside the container.  The PFD is closed when [onDestroy] is called or when
+ * a new container is successfully opened.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+
+    /**
+     * The PFD of the currently mounted container.
+     * Ownership is shared with [VeraCryptDocumentsProvider]; it is closed by
+     * [VeraCryptDocumentsProvider.unmount] (called from [onDestroy]).
+     */
+    private var containerPfd: ParcelFileDescriptor? = null
 
     private val pickContainer = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -38,6 +54,13 @@ class MainActivity : AppCompatActivity() {
         binding.btnOpenContainer.setOnClickListener {
             pickContainer.launch(arrayOf("*/*"))
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // unmount() closes the PFD owned by the provider; clear our reference.
+        VeraCryptDocumentsProvider.unmount()
+        containerPfd = null
     }
 
     private fun onContainerSelected(uri: Uri) {
@@ -67,25 +90,41 @@ class MainActivity : AppCompatActivity() {
 
         Thread {
             var pfd: ParcelFileDescriptor? = null
-            val result: Int
+            var result = Int.MIN_VALUE
+
             try {
                 pfd = contentResolver.openFileDescriptor(uri, "r")
-                result = if (pfd != null) {
-                    NativeBridge.nativeParseHeader(pfd.fd, password)
-                } else {
-                    Int.MIN_VALUE
+                if (pfd != null) {
+                    result = NativeBridge.nativeParseHeader(pfd.fd, password)
                 }
-            } finally {
+            } catch (e: Exception) {
+                Log.e(TAG, "Error opening container", e)
                 pfd?.close()
+                pfd = null
             }
+
+            // On failure, close the PFD immediately; on success hand it off to the provider.
+            if (result != 0) {
+                pfd?.close()
+                pfd = null
+            }
+
+            val successPfd = pfd // non-null only when result == 0
 
             runOnUiThread {
                 binding.btnOpenContainer.isEnabled = true
-                binding.tvStatus.text = when (result) {
-                    0          -> getString(R.string.status_header_ok)
-                    -1         -> getString(R.string.status_wrong_password)
-                    Int.MIN_VALUE -> getString(R.string.status_error_open)
-                    else       -> getString(R.string.status_error_format)
+
+                if (successPfd != null) {
+                    // Transfer PFD ownership to the provider (closes any previously mounted one)
+                    containerPfd = successPfd
+                    VeraCryptDocumentsProvider.mount(successPfd)
+                    binding.tvStatus.text = getString(R.string.status_mounted)
+                } else {
+                    binding.tvStatus.text = when (result) {
+                        -1            -> getString(R.string.status_wrong_password)
+                        Int.MIN_VALUE -> getString(R.string.status_error_open)
+                        else          -> getString(R.string.status_error_format)
+                    }
                 }
             }
         }.start()

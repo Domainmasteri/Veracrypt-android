@@ -44,6 +44,7 @@ android {
 dependencies {
     implementation(project(":core-api"))
     implementation(project(":core-native"))
+    implementation(project(":provider-saf"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)

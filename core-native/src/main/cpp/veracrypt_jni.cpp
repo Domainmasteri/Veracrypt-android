@@ -449,6 +449,12 @@ static inline uint16_t le16r(const uint8_t* p) {
 static inline uint32_t le32r(const uint8_t* p) {
     return (uint32_t)(p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24));
 }
+static inline uint64_t le64r(const uint8_t* p) {
+    return ((uint64_t)p[0])       | ((uint64_t)p[1] <<  8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
 
 // ============================================================
 // Sector reader
@@ -726,6 +732,232 @@ static uint32_t fat32_find_dir(const Fat32Info& fi, const char* path) {
 }
 
 // ============================================================
+// Filesystem detection
+// ============================================================
+
+enum FsType { FS_UNKNOWN, FS_FAT32, FS_EXFAT };
+
+static FsType detect_filesystem(int fd) {
+    uint8_t sec[VC_MAX_SECTOR_SIZE];
+    if (!vc_read_sector(fd, 0, sec)) return FS_UNKNOWN;
+
+    // exFAT: OEM name at bytes 3-10 is "EXFAT   " (with 3 trailing spaces)
+    if (memcmp(sec + 3, "EXFAT   ", 8) == 0) return FS_EXFAT;
+
+    // FAT32: BPB_BytsPerSec (offset 11) != 0 and BPB_FATSz32 (offset 36) != 0
+    uint16_t bps   = le16r(sec + 11);
+    uint32_t spf32 = le32r(sec + 36);
+    if (bps != 0 && spf32 != 0) return FS_FAT32;
+
+    return FS_UNKNOWN;
+}
+
+// ============================================================
+// exFAT parser (read-only)
+//
+// Microsoft exFAT BPB layout (sector 0 of the data area):
+//   [  3 .. 10] OEM Name "EXFAT   "
+//   [ 11 .. 63] MustBeZero
+//   [ 64 .. 71] PartitionOffset (uint64 LE)
+//   [ 72 .. 79] VolumeLength    (uint64 LE)
+//   [ 80 .. 83] FatOffset       (uint32 LE) – in sectors from vol start
+//   [ 84 .. 87] FatLength       (uint32 LE) – in sectors
+//   [ 88 .. 91] ClusterHeapOffset (uint32 LE)
+//   [ 92 .. 95] ClusterCount    (uint32 LE)
+//   [ 96 .. 99] FirstClusterOfRootDirectory (uint32 LE)
+//   [108]       BytesPerSectorShift  (uint8)
+//   [109]       SectorsPerClusterShift (uint8)
+//
+// Directory entry types used here:
+//   0x85  File (primary)  – attributes + timestamps
+//   0xC0  Stream Extension (secondary) – name length + data length
+//   0xC1  File Name (secondary) – up to 15 × UCS-2LE chars each
+// ============================================================
+
+struct ExFatInfo {
+    uint32_t fatOffset;           // first FAT sector (from start of data area)
+    uint32_t clusterHeapOffset;   // first cluster-heap sector
+    uint32_t rootCluster;         // first cluster of root directory
+    uint8_t  bytesPerSectorShift;
+    uint8_t  sectorsPerClusterShift;
+    uint32_t sectorsPerCluster;   // 1 << sectorsPerClusterShift (precomputed)
+    uint16_t bytesPerSector;      // 1 << bytesPerSectorShift   (precomputed)
+};
+
+static bool exfat_read_bpb(int fd, ExFatInfo* ei) {
+    uint8_t sec[VC_MAX_SECTOR_SIZE];
+    if (!vc_read_sector(fd, 0, sec)) {
+        LOGE("exfat_read_bpb: could not read sector 0");
+        return false;
+    }
+    if (memcmp(sec + 3, "EXFAT   ", 8) != 0) {
+        LOGE("exfat_read_bpb: OEM name mismatch");
+        return false;
+    }
+
+    uint32_t fatOffset         = le32r(sec + 80);
+    uint32_t clusterHeapOffset = le32r(sec + 88);
+    uint32_t rootCluster       = le32r(sec + 96);
+    uint8_t  bpss              = sec[108]; // BytesPerSectorShift
+    uint8_t  spcs              = sec[109]; // SectorsPerClusterShift
+
+    if (bpss < 9 || bpss > 12 || spcs > 25) {
+        LOGE("exfat_read_bpb: invalid shift values bpss=%u spcs=%u", bpss, spcs);
+        return false;
+    }
+
+    ei->fatOffset              = fatOffset;
+    ei->clusterHeapOffset      = clusterHeapOffset;
+    ei->rootCluster            = rootCluster;
+    ei->bytesPerSectorShift    = bpss;
+    ei->sectorsPerClusterShift = spcs;
+    ei->sectorsPerCluster      = 1u << spcs;
+    ei->bytesPerSector         = (uint16_t)(1u << bpss);
+
+    LOGI("exfat_read_bpb: fatOff=%u heapOff=%u rootClus=%u bps=%u spc=%u",
+         fatOffset, clusterHeapOffset, rootCluster, ei->bytesPerSector, ei->sectorsPerCluster);
+    return true;
+}
+
+// Return the logical sector (in vc_read_sector numbering) of a given cluster.
+static uint64_t exfat_cluster_to_sector(const ExFatInfo& ei, uint32_t cluster) {
+    if (cluster < 2u) return ei.clusterHeapOffset;
+    return (uint64_t)ei.clusterHeapOffset + (uint64_t)(cluster - 2u) * ei.sectorsPerCluster;
+}
+
+// Follow the exFAT FAT chain; returns next cluster value (>= 0xFFFFFFF8 = end/bad).
+static uint32_t exfat_next_cluster(int fd, const ExFatInfo& ei, uint32_t cluster) {
+    uint32_t fatByteOff = cluster * 4u;
+    uint32_t fatSector  = ei.fatOffset + fatByteOff / ei.bytesPerSector;
+    uint32_t entryOff   = fatByteOff % ei.bytesPerSector;
+
+    uint8_t sec[VC_MAX_SECTOR_SIZE];
+    if (!vc_read_sector(fd, fatSector, sec)) return 0xFFFFFFFu;
+    if (entryOff + 4u > (uint32_t)ei.bytesPerSector) return 0xFFFFFFFu;
+
+    return le32r(sec + entryOff);
+}
+
+// List all non-deleted entries in the exFAT directory starting at startCluster.
+// Handles File (0x85) + Stream Extension (0xC0) + File Name (0xC1) record groups.
+static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
+                                                 uint32_t startCluster) {
+    std::vector<DirEntry> results;
+
+    // State machine for building a complete file record across entries
+    bool     haveFile      = false;
+    uint8_t  secondaryCount = 0;
+    uint8_t  secondaryRead  = 0;
+    bool     isDir         = false;
+    uint16_t modDate       = 0;
+    uint16_t modTime       = 0;
+    int      nameLength    = 0;
+    uint64_t dataLength    = 0;
+    bool     haveStream    = false;
+    std::string pendingName;
+
+    uint32_t cluster  = startCluster;
+    bool     endOfDir = false;
+
+    while (!endOfDir && cluster >= 2u && cluster < 0xFFFFFFF8u) {
+        uint64_t firstSec = exfat_cluster_to_sector(ei, cluster);
+
+        for (uint32_t s = 0; !endOfDir && s < ei.sectorsPerCluster; s++) {
+            uint8_t sec[VC_MAX_SECTOR_SIZE];
+            if (!vc_read_sector(fd, firstSec + s, sec)) break;
+
+            uint32_t entriesPerSector = (uint32_t)ei.bytesPerSector / 32u;
+
+            for (uint32_t e = 0; e < entriesPerSector; e++) {
+                const uint8_t* ent  = sec + e * 32u;
+                uint8_t        type = ent[0];
+
+                // End-of-directory marker
+                if (type == 0x00u) { endOfDir = true; break; }
+
+                // Not-in-use (bit 7 clear = deleted / free); reset any pending record
+                if ((type & 0x80u) == 0u) {
+                    haveFile = false; haveStream = false;
+                    secondaryRead = 0; pendingName.clear();
+                    continue;
+                }
+
+                if (type == 0x85u) {
+                    // Primary File entry – start a new record
+                    secondaryCount = ent[1];
+                    uint16_t attrs = le16r(ent + 4); // FileAttributes
+                    isDir          = (attrs & 0x10u) != 0u;
+                    // LastModifiedTimestamp at offset 12 (uint32 LE, same encoding as FAT date/time)
+                    uint32_t ts = le32r(ent + 12);
+                    modDate = (uint16_t)(ts >> 16);
+                    modTime = (uint16_t)(ts & 0xFFFFu);
+                    pendingName.clear();
+                    dataLength = 0;
+                    haveFile   = true;
+                    haveStream = false;
+                    secondaryRead = 0;
+                    continue;
+                }
+
+                if (!haveFile) continue;
+
+                // Count every secondary entry toward secondaryCount
+                secondaryRead++;
+
+                if (type == 0xC0u && !haveStream) {
+                    // Stream Extension: name length + data length
+                    nameLength = (int)ent[3]; // NameLength
+                    dataLength = le64r(ent + 24); // DataLength
+                    haveStream = true;
+                } else if (type == 0xC1u) {
+                    // File Name entry: up to 15 UCS-2LE characters at bytes 2-31
+                    for (int c = 0; c < 15; c++) {
+                        int      o  = 2 + c * 2;
+                        uint16_t ch = le16r(ent + o);
+                        if (ch == 0x0000u) break;
+                        char buf[4];
+                        int nb = ucs2_to_utf8(ch, buf);
+                        pendingName.append(buf, (size_t)nb);
+                    }
+                }
+                // Any other secondary type: counted but otherwise ignored.
+
+                // Commit the record once all secondary entries have been consumed
+                if (secondaryRead == secondaryCount) {
+                    if (haveStream && !pendingName.empty() &&
+                        pendingName != "." && pendingName != "..") {
+                        uint32_t sz = (dataLength > 0xFFFFFFFFu)
+                                        ? 0xFFFFFFFFu
+                                        : (uint32_t)dataLength;
+                        results.push_back({pendingName, isDir, sz, modDate, modTime});
+                    }
+                    haveFile = false; haveStream = false;
+                    secondaryRead = 0; pendingName.clear();
+                }
+            }
+        }
+
+        if (!endOfDir) {
+            uint32_t next = exfat_next_cluster(fd, ei, cluster);
+            if (next >= 0xFFFFFFF8u) break;
+            cluster = next;
+        }
+    }
+
+    return results;
+}
+
+// Resolve `path` to a cluster number for exFAT.  Only root ("/") is supported.
+static uint32_t exfat_find_dir(const ExFatInfo& ei, const char* path) {
+    if (path == nullptr || path[0] == '\0' ||
+        (path[0] == '/' && path[1] == '\0')) {
+        return ei.rootCluster;
+    }
+    LOGE("exfat_find_dir: sub-directory navigation not yet implemented (%s)", path);
+    return 0u;
+}
+
+// ============================================================
 // JNI entry points
 // ============================================================
 
@@ -735,7 +967,7 @@ JNIEXPORT jstring JNICALL
 Java_io_veracrypt_android_corenative_NativeBridge_nativeGetVersion(
         JNIEnv *env,
         jclass /* clazz */) {
-    return env->NewStringUTF("0.3.0");
+    return env->NewStringUTF("0.4.0");
 }
 
 /**
@@ -844,7 +1076,8 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeParseHeader(
  * List the files and sub-directories at `path` inside the container.
  *
  * nativeParseHeader must have returned 0 before calling this function.
- * Reads FAT32 structures from fd using the master keys cached in g_session.
+ * Detects whether the encrypted volume contains a FAT32 or exFAT filesystem
+ * and reads structures from fd using the master keys cached in g_session.
  *
  * @param fd    File descriptor of the container (same as passed to nativeParseHeader).
  * @param path  Absolute path inside the container; currently only "/" is supported.
@@ -865,31 +1098,53 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
     const char* path = env->GetStringUTFChars(jpath, nullptr);
     if (!path) return nullptr;
 
-    Fat32Info fi;
-    bool bpbOk = fat32_read_bpb((int)jfd, &fi);
-    if (!bpbOk) {
+    // Detect the inner filesystem type
+    FsType fsType = detect_filesystem((int)jfd);
+    std::vector<DirEntry> entries;
+
+    if (fsType == FS_FAT32) {
+        Fat32Info fi;
+        if (!fat32_read_bpb((int)jfd, &fi)) {
+            env->ReleaseStringUTFChars(jpath, path);
+            LOGE("nativeListDir: FAT32 BPB read failed");
+            return nullptr;
+        }
+        uint32_t dirCluster = fat32_find_dir(fi, path);
         env->ReleaseStringUTFChars(jpath, path);
-        LOGE("nativeListDir: failed to read FAT32 BPB");
+        if (dirCluster < 2u) {
+            LOGE("nativeListDir: FAT32 directory not found");
+            return nullptr;
+        }
+        entries = fat32_list_cluster((int)jfd, fi, dirCluster);
+
+    } else if (fsType == FS_EXFAT) {
+        ExFatInfo ei;
+        if (!exfat_read_bpb((int)jfd, &ei)) {
+            env->ReleaseStringUTFChars(jpath, path);
+            LOGE("nativeListDir: exFAT BPB read failed");
+            return nullptr;
+        }
+        uint32_t dirCluster = exfat_find_dir(ei, path);
+        env->ReleaseStringUTFChars(jpath, path);
+        if (dirCluster < 2u) {
+            LOGE("nativeListDir: exFAT directory not found");
+            return nullptr;
+        }
+        entries = exfat_list_cluster((int)jfd, ei, dirCluster);
+
+    } else {
+        env->ReleaseStringUTFChars(jpath, path);
+        LOGE("nativeListDir: unsupported or unrecognised filesystem");
         return nullptr;
     }
-
-    uint32_t dirCluster = fat32_find_dir(fi, path);
-    env->ReleaseStringUTFChars(jpath, path);
-
-    if (dirCluster < 2u) {
-        LOGE("nativeListDir: directory not found");
-        return nullptr;
-    }
-
-    std::vector<DirEntry> entries = fat32_list_cluster((int)jfd, fi, dirCluster);
 
     // Build the Java VolumeEntry[] array
-    jclass     veClass = env->FindClass("io/veracrypt/android/coreapi/VolumeEntry");
+    jclass veClass = env->FindClass("io/veracrypt/android/coreapi/VolumeEntry");
     if (!veClass) { LOGE("nativeListDir: VolumeEntry class not found"); return nullptr; }
 
-    jmethodID  initId  = env->GetMethodID(veClass, "<init>",
-                             "(Ljava/lang/String;Ljava/lang/String;ZJJ)V");
-    if (!initId)  { LOGE("nativeListDir: VolumeEntry constructor not found"); return nullptr; }
+    jmethodID initId = env->GetMethodID(veClass, "<init>",
+                           "(Ljava/lang/String;Ljava/lang/String;ZJJ)V");
+    if (!initId) { LOGE("nativeListDir: VolumeEntry constructor not found"); return nullptr; }
 
     jobjectArray arr = env->NewObjectArray((jsize)entries.size(), veClass, nullptr);
     if (!arr) return nullptr;
@@ -897,7 +1152,6 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
     for (size_t i = 0; i < entries.size(); i++) {
         const DirEntry& e = entries[i];
 
-        // Build the full path string (root children are /name)
         std::string entryPath = "/" + e.name;
 
         jstring jname  = env->NewStringUTF(e.name.c_str());
@@ -916,7 +1170,8 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
         env->DeleteLocalRef(obj);
     }
 
-    LOGI("nativeListDir: returning %zu entries", entries.size());
+    LOGI("nativeListDir: returning %zu entries (fs=%s)",
+         entries.size(), fsType == FS_FAT32 ? "FAT32" : "exFAT");
     return arr;
 }
 
