@@ -104,6 +104,12 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             entryCache.clear()
             Log.i(TAG, "Container unmounted")
         }
+
+        /** Returns true when a container is currently mounted. */
+        fun isMounted(): Boolean = mountedFd >= 0
+
+        /** Returns the active mounted container fd or null when unmounted. */
+        fun mountedFdOrNull(): Int? = mountedFd.takeIf { it >= 0 }
     }
 
     override fun onCreate(): Boolean {

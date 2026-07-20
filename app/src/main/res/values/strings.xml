@@ -20,9 +20,30 @@
     <string name="status_invalid_fs">Invalid filesystem. Use FAT32, exFAT, or NTFS.</string>
     <string name="status_mount_ready">Root mount metadata prepared.</string>
     <string name="create_dialog_title">Create new container</string>
+    <string name="create_size_label">Container size</string>
     <string name="create_size_hint_mb">Size in MB</string>
+    <string name="create_password_label">Password</string>
     <string name="create_password_hint">New password</string>
+    <string name="create_fs_label">Filesystem</string>
     <string name="create_fs_hint">Filesystem: FAT32 / exFAT / NTFS</string>
     <string name="root_mount_title">Mount point</string>
     <string name="root_mount_hint">/mnt/veracrypt/main</string>
+    <string name="status_invalid_size">Invalid container size.</string>
+    <string name="status_unsupported_preview">Preview supports text, images, and PDF files only.</string>
+    <string name="status_no_viewer_app">No compatible viewer app is installed.</string>
+    <string name="explorer_up">Go up</string>
+    <string name="explorer_root_path">/</string>
+    <string name="explorer_empty">No files found in this folder.</string>
+    <string name="file_meta_folder">Folder</string>
+
+    <string-array name="create_size_units">
+        <item>MB</item>
+        <item>GB</item>
+    </string-array>
+
+    <string-array name="create_fs_options">
+        <item>FAT32</item>
+        <item>exFAT</item>
+        <item>NTFS</item>
+    </string-array>
 </resources>

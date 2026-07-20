@@ -1,12 +1,15 @@
 package io.veracrypt.android
 
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.text.InputType
 import android.util.Log
+import android.view.LayoutInflater
+import android.widget.ArrayAdapter
 import android.widget.EditText
-import android.widget.LinearLayout
+import android.widget.Spinner
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -134,6 +137,7 @@ class MainActivity : AppCompatActivity() {
                     containerPfd = successPfd
                     VeraCryptDocumentsProvider.mount(successPfd)
                     binding.tvStatus.text = getString(R.string.status_mounted)
+                    startActivity(Intent(this, FileExplorerActivity::class.java))
                 } else {
                     binding.tvStatus.text = when (result) {
                         -1            -> getString(R.string.status_wrong_password)
@@ -146,44 +150,58 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showCreateContainerDialog(uri: Uri) {
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 16, 48, 0)
-        }
-        val sizeInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            hint = getString(R.string.create_size_hint_mb)
+        val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_create_container, null)
+        val sizeInput = dialogView.findViewById<EditText>(R.id.et_size_value).apply {
             setText("128")
         }
-        val passwordInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            hint = getString(R.string.create_password_hint)
-        }
-        val fsInput = EditText(this).apply {
-            hint = getString(R.string.create_fs_hint)
-            setText("FAT32")
-        }
-        layout.addView(sizeInput)
-        layout.addView(passwordInput)
-        layout.addView(fsInput)
+        val passwordInput = dialogView.findViewById<EditText>(R.id.et_create_password)
+        val unitSpinner = dialogView.findViewById<Spinner>(R.id.spinner_size_unit)
+        val fsSpinner = dialogView.findViewById<Spinner>(R.id.spinner_filesystem)
+
+        unitSpinner.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            resources.getStringArray(R.array.create_size_units)
+        )
+        fsSpinner.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            resources.getStringArray(R.array.create_fs_options)
+        )
 
         AlertDialog.Builder(this)
             .setTitle(R.string.create_dialog_title)
-            .setView(layout)
+            .setView(dialogView)
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                val sizeMb = sizeInput.text.toString().toLongOrNull() ?: 0L
+                val sizeValue = sizeInput.text.toString().toDoubleOrNull()
+                if (sizeValue == null || sizeValue <= 0.0) {
+                    binding.tvStatus.text = getString(R.string.status_invalid_size)
+                    return@setPositiveButton
+                }
                 val password = passwordInput.text.toString().toByteArray(Charsets.UTF_8)
-                val fsTypeText = fsInput.text.toString().trim().uppercase()
-                val fsType = when (fsTypeText) {
-                    "FAT32" -> 1
-                    "EXFAT" -> 2
-                    "NTFS" -> 3
+                val unitMultiplier = when (unitSpinner.selectedItemPosition) {
+                    0 -> 1024L * 1024L
+                    1 -> 1024L * 1024L * 1024L
+                    else -> {
+                        binding.tvStatus.text = getString(R.string.status_invalid_size)
+                        return@setPositiveButton
+                    }
+                }
+                val sizeBytes = (sizeValue * unitMultiplier.toDouble()).toLong()
+                if (sizeBytes <= 0L) {
+                    binding.tvStatus.text = getString(R.string.status_invalid_size)
+                    return@setPositiveButton
+                }
+                val fsType = when (fsSpinner.selectedItemPosition) {
+                    0 -> 1
+                    1 -> 2
+                    2 -> 3
                     else -> {
                         binding.tvStatus.text = getString(R.string.status_invalid_fs)
                         return@setPositiveButton
                     }
                 }
-                createNewContainer(uri, password, sizeMb * 1024L * 1024L, fsType)
+                createNewContainer(uri, password, sizeBytes, fsType)
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
