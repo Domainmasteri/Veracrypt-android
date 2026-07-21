@@ -34,6 +34,9 @@
     <string name="explorer_up">Go up</string>
     <string name="explorer_root_path">/</string>
     <string name="explorer_empty">No files found in this folder.</string>
+    <string name="explorer_import_file">Import file</string>
+    <string name="explorer_importing">Importing file…</string>
+    <string name="explorer_import_done">Imported: %1$s</string>
     <string name="file_meta_folder">Folder</string>
 
     <string-array name="create_size_units">
