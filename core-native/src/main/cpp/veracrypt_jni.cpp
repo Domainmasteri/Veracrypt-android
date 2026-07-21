@@ -2197,10 +2197,18 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
     }
 
     const char* path = env->GetStringUTFChars(jpath, nullptr);
-    if (!path) return nullptr;
+    if (!path) {
+        LOGE("nativeListDir: GetStringUTFChars returned null");
+        return nullptr;
+    }
+    LOGI("nativeListDir: path=\"%s\"", path);
 
     // Detect the inner filesystem type
     FsType fsType = detect_filesystem((int)jfd);
+    LOGI("nativeListDir: detected fsType=%s",
+         fsType == FS_FAT32 ? "FAT32" :
+         fsType == FS_EXFAT ? "exFAT" :
+         fsType == FS_NTFS  ? "NTFS"  : "UNKNOWN");
     std::vector<DirEntry> entries;
 
     if (fsType == FS_FAT32) {
@@ -2211,9 +2219,10 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
             return nullptr;
         }
         uint32_t dirCluster = fat32_find_dir(fi, path);
+        LOGI("nativeListDir: FAT32 dirCluster=%u (rootCluster=%u)", dirCluster, fi.rootCluster);
         env->ReleaseStringUTFChars(jpath, path);
         if (dirCluster < 2u) {
-            LOGE("nativeListDir: FAT32 directory not found");
+            LOGE("nativeListDir: FAT32 directory not found (cluster=%u)", dirCluster);
             return nullptr;
         }
         entries = fat32_list_cluster((int)jfd, fi, dirCluster);
@@ -2226,16 +2235,20 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
             return nullptr;
         }
         uint32_t dirCluster = exfat_find_dir(ei, path);
+        LOGI("nativeListDir: exFAT dirCluster=%u (rootCluster=%u)", dirCluster, ei.rootCluster);
         env->ReleaseStringUTFChars(jpath, path);
         if (dirCluster < 2u) {
-            LOGE("nativeListDir: exFAT directory not found");
+            LOGE("nativeListDir: exFAT directory not found (cluster=%u)", dirCluster);
             return nullptr;
         }
         entries = exfat_list_cluster((int)jfd, ei, dirCluster);
 
     } else {
         env->ReleaseStringUTFChars(jpath, path);
-        LOGE("nativeListDir: unsupported or unrecognised filesystem");
+        if (fsType == FS_NTFS)
+            LOGE("nativeListDir: NTFS filesystem detected but not yet supported");
+        else
+            LOGE("nativeListDir: unsupported or unrecognised filesystem (fsType=%d)", (int)fsType);
         return nullptr;
     }
 
@@ -2248,7 +2261,10 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
     if (!initId) { LOGE("nativeListDir: VolumeEntry constructor not found"); return nullptr; }
 
     jobjectArray arr = env->NewObjectArray((jsize)entries.size(), veClass, nullptr);
-    if (!arr) return nullptr;
+    if (!arr) {
+        LOGE("nativeListDir: NewObjectArray failed (count=%zu)", entries.size());
+        return nullptr;
+    }
 
     for (size_t i = 0; i < entries.size(); i++) {
         const DirEntry& e = entries[i];
