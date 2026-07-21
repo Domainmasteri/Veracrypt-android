@@ -798,6 +798,19 @@ static std::vector<DirEntry> fat32_list_cluster(int fd, const Fat32Info& fi,
     return results;
 }
 
+// Split an absolute path like "/dir/sub/file.txt" into ["dir", "sub", "file.txt"].
+static std::vector<std::string> split_path(const std::string& path) {
+    std::vector<std::string> parts;
+    size_t start = (!path.empty() && path[0] == '/') ? 1u : 0u;
+    while (start < path.size()) {
+        size_t end = path.find('/', start);
+        if (end == std::string::npos) end = path.size();
+        if (end > start) parts.push_back(path.substr(start, end - start));
+        start = end + 1;
+    }
+    return parts;
+}
+
 // Resolve `path` to a cluster number.  Only root ("/") is supported in this
 // milestone; deeper paths always return 0 (not found).
 static uint32_t fat32_find_dir(const Fat32Info& fi, const char* path) {
@@ -1088,18 +1101,6 @@ static uint32_t exfat_find_dir(const ExFatInfo& ei, const char* path) {
 // Path utilities and file-reading helpers
 // ============================================================
 
-// Split an absolute path like "/dir/sub/file.txt" into ["dir", "sub", "file.txt"].
-static std::vector<std::string> split_path(const std::string& path) {
-    std::vector<std::string> parts;
-    size_t start = (!path.empty() && path[0] == '/') ? 1u : 0u;
-    while (start < path.size()) {
-        size_t end = path.find('/', start);
-        if (end == std::string::npos) end = path.size();
-        if (end > start) parts.push_back(path.substr(start, end - start));
-        start = end + 1;
-    }
-    return parts;
-}
 
 // Find the DirEntry for the file at `path` inside a FAT32 filesystem.
 // Returns true and fills `out` on success; false if not found or path is a directory.
