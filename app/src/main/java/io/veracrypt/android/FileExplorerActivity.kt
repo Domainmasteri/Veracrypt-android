@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -12,6 +13,7 @@ import android.widget.BaseAdapter
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.addCallback
 import androidx.appcompat.app.AppCompatActivity
 import io.veracrypt.android.coreapi.VolumeEntry
@@ -19,6 +21,7 @@ import io.veracrypt.android.corenative.NativeBridge
 import io.veracrypt.android.databinding.ActivityFileExplorerBinding
 import io.veracrypt.android.databinding.ItemExplorerEntryBinding
 import io.veracrypt.android.providersaf.VeraCryptDocumentsProvider
+import java.io.IOException
 import java.text.DecimalFormat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -29,6 +32,12 @@ class FileExplorerActivity : AppCompatActivity() {
     private val adapter = EntryAdapter()
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private var currentPath: String = "/"
+    private val importDocumentLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                importFileFromUri(uri)
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,6 +47,7 @@ class FileExplorerActivity : AppCompatActivity() {
         binding.listEntries.adapter = adapter
         binding.listEntries.emptyView = binding.tvEmpty
         binding.btnUp.setOnClickListener { navigateUp() }
+        binding.fabImport.setOnClickListener { launchImportPicker() }
         binding.listEntries.setOnItemClickListener { _, _, position, _ ->
             val entry = adapter.getItem(position)
             if (entry.isDirectory) {
@@ -80,16 +90,98 @@ class FileExplorerActivity : AppCompatActivity() {
         binding.tvCurrentPath.text = path
         binding.btnUp.isEnabled = path != "/"
         worker.execute {
-            val listed = NativeBridge.nativeListDir(fd, path)
-                ?.sortedWith(compareBy<VolumeEntry> { !it.isDirectory }.thenBy { it.name.lowercase() })
-                ?: emptyList()
+            try {
+                val listed = NativeBridge.nativeListDir(fd, path)
+                    ?.sortedWith(compareBy<VolumeEntry> { !it.isDirectory }.thenBy { it.name.lowercase() })
+                    ?: throw IllegalStateException("nativeListDir returned null for $path")
 
-            runOnUiThread {
-                currentPath = path
-                adapter.submit(listed)
-                binding.progress.visibility = View.GONE
+                runOnUiThread {
+                    currentPath = path
+                    adapter.submit(listed)
+                    binding.progress.visibility = View.GONE
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    binding.progress.visibility = View.GONE
+                    Toast.makeText(
+                        this,
+                        e.message ?: e.toString(),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         }
+    }
+
+    private fun launchImportPicker() {
+        importDocumentLauncher.launch(arrayOf("*/*"))
+    }
+
+    private fun importFileFromUri(uri: Uri) {
+        val fd = VeraCryptDocumentsProvider.mountedFdOrNull() ?: run {
+            finish()
+            return
+        }
+        val fileName = resolveImportName(uri)
+        val destinationPath = joinPath(currentPath, fileName)
+
+        binding.progress.visibility = View.VISIBLE
+        Toast.makeText(this, getString(R.string.explorer_importing), Toast.LENGTH_SHORT).show()
+
+        worker.execute {
+            try {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    val buffer = ByteArray(65536)
+                    var offset = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
+                        val written = NativeBridge.nativeWriteFile(fd, destinationPath, offset, chunk)
+                        if (written <= 0) {
+                            throw IOException("nativeWriteFile failed ($written) for $destinationPath")
+                        }
+                        offset += written
+                    }
+                } ?: throw IOException("Unable to open input stream for $uri")
+
+                runOnUiThread {
+                    binding.progress.visibility = View.GONE
+                    Toast.makeText(
+                        this,
+                        getString(R.string.explorer_import_done, fileName),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    loadPath(currentPath)
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    binding.progress.visibility = View.GONE
+                    Toast.makeText(
+                        this,
+                        e.message ?: e.toString(),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun resolveImportName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) {
+                val name = cursor.getString(index)
+                if (!name.isNullOrBlank()) return name
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+            ?: "imported_file"
+    }
+
+    private fun joinPath(base: String, name: String): String {
+        val cleanName = name.substringAfterLast('/').ifBlank { "imported_file" }
+        return if (base == "/") "/$cleanName" else "${base.trimEnd('/')}/$cleanName"
     }
 
     private fun openFile(entry: VolumeEntry) {
