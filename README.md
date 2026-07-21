@@ -15,6 +15,8 @@ Android multi-module implementation for opening, creating, and modifying VeraCry
 - Filesystem selection at creation time: FAT32, exFAT, NTFS signatures
 - Root/FUSE mount preparation hook for advanced rooted-device workflows
 - SAF `DocumentsProvider` integration for read and write streaming
+- In-app container file explorer with nested directory navigation
+- Secure in-memory file preview streaming for PDF/text/image files
 - CI pipeline for debug and signed release APK artifacts
 
 ## Modules

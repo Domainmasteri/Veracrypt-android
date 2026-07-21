@@ -21,6 +21,16 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".FileExplorerActivity"
+            android:exported="false" />
+
+        <provider
+            android:name=".ContainerViewerProvider"
+            android:authorities="io.veracrypt.android.viewer"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
     </application>
 
 </manifest>
