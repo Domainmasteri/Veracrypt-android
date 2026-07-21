@@ -2399,6 +2399,12 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
     if (!path) return -1;
 
     FsType fsType = detect_filesystem((int)jfd);
+    LOGI("nativeWriteFile: path=\"%s\" offset=%lld dataLen=%d fsType=%s",
+         path, (long long)offset, (int)dataLen,
+         fsType == FS_FAT32 ? "FAT32" :
+         fsType == FS_EXFAT ? "exFAT" :
+         fsType == FS_NTFS  ? "NTFS"  : "UNKNOWN");
+
     DirEntry entry;
     bool found = false;
     bool ok = false;
@@ -2412,11 +2418,14 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
         Fat32Info fi;
         if (fat32_read_bpb((int)jfd, &fi)) {
             found = fat32_find_file((int)jfd, fi, path, entry);
+            LOGI("nativeWriteFile: FAT32 fat32_find_file found=%d rootCluster=%u", (int)found, fi.rootCluster);
             if (!found && offset == 0) {
                 // File does not exist yet – create it (O_CREAT semantics).
                 auto parts = split_path(std::string(path));
+                LOGI("nativeWriteFile: FAT32 creating new file parts.size=%zu", parts.size());
                 if (parts.size() == 1) {
                     int fc = fat32_allocate_clusters((int)jfd, fi, 1);
+                    LOGI("nativeWriteFile: FAT32 fat32_allocate_clusters returned fc=%d", fc);
                     if (fc >= 2) {
                         found = fat32_create_file((int)jfd, fi, fi.rootCluster,
                                                    parts[0], (uint32_t)fc,
@@ -2430,22 +2439,33 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
                 }
             }
             if (found) {
+                LOGI("nativeWriteFile: FAT32 writing data firstCluster=%u sizeBytes=%u",
+                     entry.firstCluster, entry.sizeBytes);
                 ok = fat32_write_file_data((int)jfd, fi, entry, (uint64_t)offset, buf.data(), dataLen);
                 if (ok) {
                     uint32_t size = (uint32_t)std::max((uint64_t)entry.sizeBytes, writeEnd);
                     ok = fat32_update_root_entry((int)jfd, fi, path, size, modDate, modTime);
+                    if (!ok) LOGE("nativeWriteFile: fat32_update_root_entry failed for %s", path);
+                } else {
+                    LOGE("nativeWriteFile: fat32_write_file_data failed for %s offset=%lld",
+                         path, (long long)offset);
                 }
             }
+        } else {
+            LOGE("nativeWriteFile: FAT32 BPB read failed for path=%s", path);
         }
     } else if (fsType == FS_EXFAT) {
         ExFatInfo ei;
         if (exfat_read_bpb((int)jfd, &ei)) {
             found = exfat_find_file((int)jfd, ei, path, entry);
+            LOGI("nativeWriteFile: exFAT exfat_find_file found=%d rootCluster=%u", (int)found, ei.rootCluster);
             if (!found && offset == 0) {
                 // File does not exist yet – create it (O_CREAT semantics).
                 auto parts = split_path(std::string(path));
+                LOGI("nativeWriteFile: exFAT creating new file parts.size=%zu", parts.size());
                 if (parts.size() == 1) {
                     int fc = exfat_allocate_clusters((int)jfd, ei, 1);
+                    LOGI("nativeWriteFile: exFAT exfat_allocate_clusters returned fc=%d", fc);
                     if (fc >= 2) {
                         found = exfat_create_file((int)jfd, ei, ei.rootCluster,
                                                    parts[0], (uint32_t)fc,
@@ -2459,14 +2479,22 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
                 }
             }
             if (found) {
+                LOGI("nativeWriteFile: exFAT writing data firstCluster=%u sizeBytes=%u",
+                     entry.firstCluster, entry.sizeBytes);
                 ok = exfat_write_file_data((int)jfd, ei, entry, (uint64_t)offset, buf.data(), dataLen);
                 if (ok) {
                     uint64_t newSize = std::max((uint64_t)entry.sizeBytes, writeEnd);
                     ok = exfat_update_entry_size((int)jfd, ei, ei.rootCluster,
                                                   entry, newSize, modDate, modTime);
                     if (ok) entry.sizeBytes = (uint32_t)std::min(newSize, (uint64_t)0xFFFFFFFFu);
+                    else LOGE("nativeWriteFile: exfat_update_entry_size failed for %s", path);
+                } else {
+                    LOGE("nativeWriteFile: exfat_write_file_data failed for %s offset=%lld",
+                         path, (long long)offset);
                 }
             }
+        } else {
+            LOGE("nativeWriteFile: exFAT BPB read failed for path=%s", path);
         }
     } else if (fsType == FS_NTFS) {
         // NTFS mutation remains disabled until journaling/metadata updates are fully implemented.
@@ -2475,8 +2503,8 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
 
     env->ReleaseStringUTFChars(jpath, path);
     if (unsupportedFsOp) return -2;
-    if (!found) return -2;
-    if (!ok) return -3;
+    if (!found) { LOGE("nativeWriteFile: returning -2 (not found/created)"); return -2; }
+    if (!ok)    { LOGE("nativeWriteFile: returning -3 (write failed)"); return -3; }
     return dataLen;
 }
 
