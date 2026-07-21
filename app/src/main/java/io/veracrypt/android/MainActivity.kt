@@ -111,7 +111,16 @@ class MainActivity : AppCompatActivity() {
             var result = Int.MIN_VALUE
 
             try {
-                pfd = contentResolver.openFileDescriptor(uri, "r")
+                // Open read-write so that nativeWriteFile can allocate FAT clusters
+                // and write directory entries via vc_write_sector.  Fall back to
+                // read-only for containers on read-only storage (e.g. a network share
+                // or a file opened from a read-only URI).
+                pfd = try {
+                    contentResolver.openFileDescriptor(uri, "rw")
+                } catch (_: Exception) {
+                    Log.w(TAG, "Could not open container rw; falling back to r (writes will fail)")
+                    contentResolver.openFileDescriptor(uri, "r")
+                }
                 if (pfd != null) {
                     result = NativeBridge.nativeParseHeader(pfd.fd, password)
                 }

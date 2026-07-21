@@ -801,8 +801,10 @@ static std::vector<DirEntry> fat32_list_cluster(int fd, const Fat32Info& fi,
 // Resolve `path` to a cluster number.  Only root ("/") is supported in this
 // milestone; deeper paths always return 0 (not found).
 static uint32_t fat32_find_dir(const Fat32Info& fi, const char* path) {
-    if (path == nullptr || path[0] == '\0' ||
-        (path[0] == '/' && path[1] == '\0')) {
+    if (path == nullptr || path[0] == '\0') return fi.rootCluster;
+    // Any path whose non-empty components are zero (e.g. "/", "//") maps to root.
+    if (split_path(std::string(path)).empty()) {
+        LOGI("fat32_find_dir: path=\"%s\" → root cluster %u", path, fi.rootCluster);
         return fi.rootCluster;
     }
     LOGE("fat32_find_dir: sub-directory navigation not yet implemented (%s)", path);
@@ -817,7 +819,10 @@ enum FsType { FS_UNKNOWN, FS_FAT32, FS_EXFAT, FS_NTFS };
 
 static FsType detect_filesystem(int fd) {
     uint8_t sec[VC_MAX_SECTOR_SIZE];
-    if (!vc_read_sector(fd, 0, sec)) return FS_UNKNOWN;
+    if (!vc_read_sector(fd, 0, sec)) {
+        LOGE("detect_filesystem: vc_read_sector(sector 0) failed");
+        return FS_UNKNOWN;
+    }
 
     // exFAT: OEM name at bytes 3-10 is "EXFAT   " (with 3 trailing spaces)
     if (memcmp(sec + 3, "EXFAT   ", 8) == 0) return FS_EXFAT;
@@ -828,6 +833,11 @@ static FsType detect_filesystem(int fd) {
     uint32_t spf32 = le32r(sec + 36);
     if (bps != 0 && spf32 != 0) return FS_FAT32;
 
+    // None of the known signatures matched – log the raw bytes so we can debug.
+    LOGE("detect_filesystem: unrecognised FS – OEM=[%02x%02x%02x%02x%02x%02x%02x%02x]"
+         " bps=%u spf32=%u sec0byte0=%02x",
+         sec[3], sec[4], sec[5], sec[6], sec[7], sec[8], sec[9], sec[10],
+         (unsigned)bps, (unsigned)spf32, (unsigned)sec[0]);
     return FS_UNKNOWN;
 }
 
@@ -1064,8 +1074,10 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
 
 // Resolve `path` to a cluster number for exFAT.  Only root ("/") is supported.
 static uint32_t exfat_find_dir(const ExFatInfo& ei, const char* path) {
-    if (path == nullptr || path[0] == '\0' ||
-        (path[0] == '/' && path[1] == '\0')) {
+    if (path == nullptr || path[0] == '\0') return ei.rootCluster;
+    // Any path whose non-empty components are zero (e.g. "/", "//") maps to root.
+    if (split_path(std::string(path)).empty()) {
+        LOGI("exfat_find_dir: path=\"%s\" → root cluster %u", path, ei.rootCluster);
         return ei.rootCluster;
     }
     LOGE("exfat_find_dir: sub-directory navigation not yet implemented (%s)", path);
@@ -2349,7 +2361,9 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
         LOGE("nativeListDir: GetStringUTFChars returned null");
         return nullptr;
     }
-    LOGI("nativeListDir: path=\"%s\"", path);
+    LOGI("nativeListDir: path=\"%s\" fd=%d dataOffset=%llu sectorSize=%u",
+         path, (int)jfd,
+         (unsigned long long)g_session.dataOffset, g_session.sectorSize);
 
     // Detect the inner filesystem type
     FsType fsType = detect_filesystem((int)jfd);
@@ -2549,11 +2563,13 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeWriteFile(
     if (!path) return -1;
 
     FsType fsType = detect_filesystem((int)jfd);
-    LOGI("nativeWriteFile: path=\"%s\" offset=%lld dataLen=%d fsType=%s",
-         path, (long long)offset, (int)dataLen,
+    LOGI("nativeWriteFile: path=\"%s\" fd=%d offset=%lld dataLen=%d fsType=%s"
+         " dataOffset=%llu sectorSize=%u",
+         path, (int)jfd, (long long)offset, (int)dataLen,
          fsType == FS_FAT32 ? "FAT32" :
          fsType == FS_EXFAT ? "exFAT" :
-         fsType == FS_NTFS  ? "NTFS"  : "UNKNOWN");
+         fsType == FS_NTFS  ? "NTFS"  : "UNKNOWN",
+         (unsigned long long)g_session.dataOffset, g_session.sectorSize);
 
     DirEntry entry;
     bool found = false;
