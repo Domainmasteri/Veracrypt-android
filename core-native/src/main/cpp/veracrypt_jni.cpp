@@ -917,8 +917,15 @@ static uint32_t exfat_next_cluster(int fd, const ExFatInfo& ei, uint32_t cluster
     uint32_t entryOff   = fatByteOff % ei.bytesPerSector;
 
     uint8_t sec[VC_MAX_SECTOR_SIZE];
-    if (!vc_read_sector(fd, fatSector, sec)) return 0xFFFFFFFu;
-    if (entryOff + 4u > (uint32_t)ei.bytesPerSector) return 0xFFFFFFFu;
+    if (!vc_read_sector(fd, fatSector, sec)) {
+        LOGE("exfat_next_cluster: sector read failed for cluster=%u fatSector=%u", cluster, fatSector);
+        return 0xFFFFFFFFu;  // end-of-chain sentinel; 0xFFFFFFFu (7 F's) is not >= 0xFFFFFFF8 and would cause looping
+    }
+    if (entryOff + 4u > (uint32_t)ei.bytesPerSector) {
+        LOGE("exfat_next_cluster: entryOff=%u out of range for bytesPerSector=%u cluster=%u",
+             entryOff, ei.bytesPerSector, cluster);
+        return 0xFFFFFFFFu;
+    }
 
     return le32r(sec + entryOff);
 }
@@ -928,6 +935,11 @@ static uint32_t exfat_next_cluster(int fd, const ExFatInfo& ei, uint32_t cluster
 static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                                                  uint32_t startCluster) {
     std::vector<DirEntry> results;
+
+    if (startCluster < 2u) {
+        LOGE("exfat_list_cluster: invalid startCluster=%u", startCluster);
+        return results;
+    }
 
     // State machine for building a complete file record across entries
     bool     haveFile      = false;
@@ -949,10 +961,15 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
 
     while (!endOfDir && cluster >= 2u && cluster < 0xFFFFFFF8u) {
         uint64_t firstSec = exfat_cluster_to_sector(ei, cluster);
+        LOGI("exfat_list_cluster: scanning cluster=%u firstSec=%llu", cluster, (unsigned long long)firstSec);
 
         for (uint32_t s = 0; !endOfDir && s < ei.sectorsPerCluster; s++) {
             uint8_t sec[VC_MAX_SECTOR_SIZE];
-            if (!vc_read_sector(fd, firstSec + s, sec)) break;
+            if (!vc_read_sector(fd, firstSec + s, sec)) {
+                LOGE("exfat_list_cluster: sector read failed cluster=%u sector=%llu",
+                     cluster, (unsigned long long)(firstSec + s));
+                break;
+            }
 
             uint32_t entriesPerSector = (uint32_t)ei.bytesPerSector / 32u;
 
@@ -1022,6 +1039,11 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
                                         ? 0xFFFFFFFFu
                                         : (uint32_t)dataLength;
                         results.push_back({pendingName, isDir, sz, modDate, modTime, streamCluster, primarySector, primaryOffset});
+                        LOGI("exfat_list_cluster: found entry \"%s\" isDir=%d cluster=%u size=%u",
+                             pendingName.c_str(), (int)isDir, streamCluster, sz);
+                    } else if (!haveStream) {
+                        LOGE("exfat_list_cluster: record for \"%s\" committed without stream extension",
+                             pendingName.c_str());
                     }
                     haveFile = false; haveStream = false;
                     secondaryRead = 0; streamCluster = 0; pendingName.clear();
@@ -1036,6 +1058,7 @@ static std::vector<DirEntry> exfat_list_cluster(int fd, const ExFatInfo& ei,
         }
     }
 
+    LOGI("exfat_list_cluster: startCluster=%u returned %zu entries", startCluster, results.size());
     return results;
 }
 
@@ -1148,28 +1171,51 @@ static ssize_t fat32_read_file_data(int fd, const Fat32Info& fi,
 // Returns true and fills `out` on success; false if not found or path is a directory.
 static bool exfat_find_file(int fd, const ExFatInfo& ei,
                               const char* path, DirEntry& out) {
-    if (!path || path[0] == '\0') return false;
+    if (!path || path[0] == '\0') {
+        LOGE("exfat_find_file: null or empty path");
+        return false;
+    }
     auto parts = split_path(std::string(path));
-    if (parts.empty()) return false;
+    if (parts.empty()) {
+        // path is "/" or equivalent – that is a directory, not a file
+        LOGI("exfat_find_file: path=\"%s\" resolves to a directory (no file parts)", path);
+        return false;
+    }
+
+    LOGI("exfat_find_file: path=\"%s\" parts=%zu rootCluster=%u", path, parts.size(), ei.rootCluster);
 
     uint32_t cluster = ei.rootCluster;
     for (size_t i = 0; i < parts.size(); i++) {
         auto entries = exfat_list_cluster(fd, ei, cluster);
+        LOGI("exfat_find_file: searching cluster=%u for \"%s\" (%zu entries)",
+             cluster, parts[i].c_str(), entries.size());
         bool found = false;
         for (auto& e : entries) {
             if (e.name == parts[i]) {
                 if (i == parts.size() - 1) {
-                    if (e.isDir) return false;
+                    if (e.isDir) {
+                        LOGE("exfat_find_file: \"%s\" is a directory, not a file", path);
+                        return false;
+                    }
                     out = e;
+                    LOGI("exfat_find_file: found \"%s\" firstCluster=%u size=%u",
+                         path, e.firstCluster, e.sizeBytes);
                     return true;
                 }
-                if (!e.isDir) return false;
+                if (!e.isDir) {
+                    LOGE("exfat_find_file: path component \"%s\" is a file, expected dir",
+                         parts[i].c_str());
+                    return false;
+                }
                 cluster = e.firstCluster;
                 found = true;
                 break;
             }
         }
-        if (!found) return false;
+        if (!found) {
+            LOGI("exfat_find_file: \"%s\" not found in cluster=%u", parts[i].c_str(), cluster);
+            return false;
+        }
     }
     return false;
 }
@@ -1265,11 +1311,20 @@ static int fat32_allocate_clusters(int fd, const Fat32Info& fi, int count) {
             allocated.push_back(c);
         }
     }
-    if ((int)allocated.size() != count) return -1;
+    if ((int)allocated.size() != count) {
+        LOGE("fat32_allocate_clusters: could not find %d free clusters"
+             " (found %zu, maxClusters=%u)",
+             count, allocated.size(), maxClusters);
+        return -1;
+    }
     for (size_t i = 0; i < allocated.size(); i++) {
         uint32_t next = (i + 1 < allocated.size()) ? allocated[i + 1] : 0x0FFFFFFFu;
-        if (!fat32_set_next_cluster(fd, fi, allocated[i], next)) return -1;
+        if (!fat32_set_next_cluster(fd, fi, allocated[i], next)) {
+            LOGE("fat32_allocate_clusters: fat32_set_next_cluster failed for cluster=%u", allocated[i]);
+            return -1;
+        }
     }
+    LOGI("fat32_allocate_clusters: allocated %d cluster(s) starting at %u", count, allocated.front());
     return (int)allocated.front();
 }
 
@@ -1292,11 +1347,20 @@ static int exfat_allocate_clusters(int fd, const ExFatInfo& ei, int count) {
             allocated.push_back(c);
         }
     }
-    if ((int)allocated.size() != count) return -1;
+    if ((int)allocated.size() != count) {
+        LOGE("exfat_allocate_clusters: could not find %d free clusters"
+             " (found %zu, clusterCount=%u)",
+             count, allocated.size(), ei.clusterCount);
+        return -1;
+    }
     for (size_t i = 0; i < allocated.size(); i++) {
         uint32_t next = (i + 1 < allocated.size()) ? allocated[i + 1] : 0xFFFFFFFFu;
-        if (!exfat_set_next_cluster(fd, ei, allocated[i], next)) return -1;
+        if (!exfat_set_next_cluster(fd, ei, allocated[i], next)) {
+            LOGE("exfat_allocate_clusters: exfat_set_next_cluster failed for cluster=%u", allocated[i]);
+            return -1;
+        }
     }
+    LOGI("exfat_allocate_clusters: allocated %d cluster(s) starting at %u", count, allocated.front());
     return (int)allocated.front();
 }
 
@@ -1655,8 +1719,14 @@ static bool fat32_append_dir_entries(
 static bool fat32_create_file(int fd, const Fat32Info& fi, uint32_t dirCluster,
                                const std::string& filename, uint32_t firstCluster,
                                uint16_t modDate, uint16_t modTime, DirEntry& out) {
+    LOGI("fat32_create_file: filename=\"%s\" dirCluster=%u firstCluster=%u",
+         filename.c_str(), dirCluster, firstCluster);
+
     auto ucs2 = utf8_to_ucs2(filename);
-    if (ucs2.empty()) return false;
+    if (ucs2.empty()) {
+        LOGE("fat32_create_file: utf8_to_ucs2 returned empty for \"%s\"", filename.c_str());
+        return false;
+    }
 
     uint8_t name83[11];
     make_83_basis(filename, name83);
@@ -1664,7 +1734,11 @@ static bool fat32_create_file(int fd, const Fat32Info& fi, uint32_t dirCluster,
 
     int lfnCount = (int)((ucs2.size() + 12u) / 13u);
     if (lfnCount < 1)  lfnCount = 1;
-    if (lfnCount > 20) return false; // >260 chars not supported
+    if (lfnCount > 20) {
+        LOGE("fat32_create_file: lfnCount=%d exceeds 20 for \"%s\" (len=%zu)",
+             lfnCount, filename.c_str(), ucs2.size());
+        return false; // >260 chars not supported
+    }
 
     // Pad UCS-2 to a multiple of 13 (null terminator + 0xFFFF fill).
     std::vector<uint16_t> padded = ucs2;
@@ -1713,8 +1787,11 @@ static bool fat32_create_file(int fd, const Fat32Info& fi, uint32_t dirCluster,
     uint64_t firstSec, lastSec;
     uint32_t firstOff, lastOff;
     if (!fat32_append_dir_entries(fd, fi, dirCluster, entries,
-                                   firstSec, firstOff, lastSec, lastOff))
+                                   firstSec, firstOff, lastSec, lastOff)) {
+        LOGE("fat32_create_file: fat32_append_dir_entries failed for \"%s\" dirCluster=%u",
+             filename.c_str(), dirCluster);
         return false;
+    }
 
     out.name         = filename;
     out.isDir        = false;
@@ -1724,6 +1801,8 @@ static bool fat32_create_file(int fd, const Fat32Info& fi, uint32_t dirCluster,
     out.firstCluster = firstCluster;
     out.recordSector = lastSec;   // 8.3 entry position
     out.recordOffset = lastOff;
+    LOGI("fat32_create_file: success \"%s\" at sector=%llu offset=%u",
+         filename.c_str(), (unsigned long long)lastSec, lastOff);
     return true;
 }
 
@@ -1761,7 +1840,10 @@ static bool exfat_append_dir_entries(
         uint64_t& outFirstSector, uint32_t& outFirstOffset,
         uint64_t& outLastSector,  uint32_t& outLastOffset) {
 
-    if (entries.empty()) return false;
+    if (entries.empty()) {
+        LOGE("exfat_append_dir_entries: entries vector is empty");
+        return false;
+    }
     uint32_t spc = ei.sectorsPerCluster;
 
     uint32_t cluster     = dirCluster;
@@ -1773,7 +1855,11 @@ static bool exfat_append_dir_entries(
 
         for (uint32_t s = 0; s < spc; s++) {
             uint8_t sec[VC_MAX_SECTOR_SIZE];
-            if (!vc_read_sector(fd, firstSec + s, sec)) return false;
+            if (!vc_read_sector(fd, firstSec + s, sec)) {
+                LOGE("exfat_append_dir_entries: sector read failed cluster=%u sector=%llu",
+                     cluster, (unsigned long long)(firstSec + s));
+                return false;
+            }
             uint32_t eps = (uint32_t)ei.bytesPerSector / 32u;
 
             for (uint32_t e = 0; e < eps; e++) {
@@ -1790,14 +1876,25 @@ static bool exfat_append_dir_entries(
                         uint32_t next = exfat_next_cluster(fd, ei, curClus);
                         if (next >= 0xFFFFFFF8u) {
                             int nc = exfat_allocate_clusters(fd, ei, 1);
-                            if (nc < 2) return false;
-                            if (!exfat_set_next_cluster(fd, ei, curClus, (uint32_t)nc))
+                            if (nc < 2) {
+                                LOGE("exfat_append_dir_entries: cluster expansion failed (inline)");
                                 return false;
+                            }
+                            if (!exfat_set_next_cluster(fd, ei, curClus, (uint32_t)nc)) {
+                                LOGE("exfat_append_dir_entries: set_next_cluster failed curClus=%u nc=%d",
+                                     curClus, nc);
+                                return false;
+                            }
                             uint64_t nfs = exfat_cluster_to_sector(ei, (uint32_t)nc);
                             uint8_t zeros[VC_MAX_SECTOR_SIZE];
                             memset(zeros, 0, sizeof(zeros));
-                            for (uint32_t zs = 0; zs < spc; zs++)
-                                if (!vc_write_sector(fd, nfs + zs, zeros)) return false;
+                            for (uint32_t zs = 0; zs < spc; zs++) {
+                                if (!vc_write_sector(fd, nfs + zs, zeros)) {
+                                    LOGE("exfat_append_dir_entries: zero-fill write failed sector=%llu",
+                                         (unsigned long long)(nfs + zs));
+                                    return false;
+                                }
+                            }
                             curClus  = (uint32_t)nc;
                             curFirst = nfs;
                             curSec   = nfs;
@@ -1811,9 +1908,15 @@ static bool exfat_append_dir_entries(
                     }
 
                     uint8_t wsec[VC_MAX_SECTOR_SIZE];
-                    if (!vc_read_sector(fd, curSec, wsec)) return false;
+                    if (!vc_read_sector(fd, curSec, wsec)) {
+                        LOGE("exfat_append_dir_entries: read for write failed sector=%llu", (unsigned long long)curSec);
+                        return false;
+                    }
                     memcpy(wsec + curOff, entries[i].data(), 32u);
-                    if (!vc_write_sector(fd, curSec, wsec)) return false;
+                    if (!vc_write_sector(fd, curSec, wsec)) {
+                        LOGE("exfat_append_dir_entries: write failed sector=%llu", (unsigned long long)curSec);
+                        return false;
+                    }
 
                     if (!recorded) {
                         outFirstSector = curSec;
@@ -1839,15 +1942,27 @@ static bool exfat_append_dir_entries(
     }
 
     // Directory full: allocate a new cluster.
+    LOGI("exfat_append_dir_entries: directory full, extending from lastCluster=%u", lastCluster);
     int nc = exfat_allocate_clusters(fd, ei, 1);
-    if (nc < 2) return false;
-    if (!exfat_set_next_cluster(fd, ei, lastCluster, (uint32_t)nc)) return false;
+    if (nc < 2) {
+        LOGE("exfat_append_dir_entries: cluster allocation failed for directory extension");
+        return false;
+    }
+    if (!exfat_set_next_cluster(fd, ei, lastCluster, (uint32_t)nc)) {
+        LOGE("exfat_append_dir_entries: set_next_cluster failed lastCluster=%u nc=%d", lastCluster, nc);
+        return false;
+    }
     uint64_t nfs = exfat_cluster_to_sector(ei, (uint32_t)nc);
     {
         uint8_t zeros[VC_MAX_SECTOR_SIZE];
         memset(zeros, 0, sizeof(zeros));
-        for (uint32_t zs = 0; zs < spc; zs++)
-            if (!vc_write_sector(fd, nfs + zs, zeros)) return false;
+        for (uint32_t zs = 0; zs < spc; zs++) {
+            if (!vc_write_sector(fd, nfs + zs, zeros)) {
+                LOGE("exfat_append_dir_entries: zero-fill write failed sector=%llu",
+                     (unsigned long long)(nfs + zs));
+                return false;
+            }
+        }
     }
 
     uint64_t curSec   = nfs;
@@ -1859,13 +1974,24 @@ static bool exfat_append_dir_entries(
     for (size_t i = 0; i < entries.size(); i++) {
         if (curSec >= curFirst + spc) {
             int nc2 = exfat_allocate_clusters(fd, ei, 1);
-            if (nc2 < 2) return false;
-            if (!exfat_set_next_cluster(fd, ei, curClus, (uint32_t)nc2)) return false;
+            if (nc2 < 2) {
+                LOGE("exfat_append_dir_entries: cluster allocation failed for overflow");
+                return false;
+            }
+            if (!exfat_set_next_cluster(fd, ei, curClus, (uint32_t)nc2)) {
+                LOGE("exfat_append_dir_entries: set_next_cluster failed curClus=%u nc2=%d", curClus, nc2);
+                return false;
+            }
             uint64_t nfs2 = exfat_cluster_to_sector(ei, (uint32_t)nc2);
             uint8_t zeros[VC_MAX_SECTOR_SIZE];
             memset(zeros, 0, sizeof(zeros));
-            for (uint32_t zs = 0; zs < spc; zs++)
-                if (!vc_write_sector(fd, nfs2 + zs, zeros)) return false;
+            for (uint32_t zs = 0; zs < spc; zs++) {
+                if (!vc_write_sector(fd, nfs2 + zs, zeros)) {
+                    LOGE("exfat_append_dir_entries: zero-fill write failed sector=%llu",
+                         (unsigned long long)(nfs2 + zs));
+                    return false;
+                }
+            }
             curClus  = (uint32_t)nc2;
             curFirst = nfs2;
             curSec   = nfs2;
@@ -1873,9 +1999,15 @@ static bool exfat_append_dir_entries(
         }
 
         uint8_t wsec[VC_MAX_SECTOR_SIZE];
-        if (!vc_read_sector(fd, curSec, wsec)) return false;
+        if (!vc_read_sector(fd, curSec, wsec)) {
+            LOGE("exfat_append_dir_entries: read for write failed sector=%llu (overflow path)", (unsigned long long)curSec);
+            return false;
+        }
         memcpy(wsec + curOff, entries[i].data(), 32u);
-        if (!vc_write_sector(fd, curSec, wsec)) return false;
+        if (!vc_write_sector(fd, curSec, wsec)) {
+            LOGE("exfat_append_dir_entries: write failed sector=%llu (overflow path)", (unsigned long long)curSec);
+            return false;
+        }
 
         if (!recorded) {
             outFirstSector = curSec;
@@ -1894,6 +2026,7 @@ static bool exfat_append_dir_entries(
             curSec++;
         }
     }
+    LOGE("exfat_append_dir_entries: fell through without writing all entries");
     return false;
 }
 
@@ -1903,12 +2036,22 @@ static bool exfat_append_dir_entries(
 static bool exfat_create_file(int fd, const ExFatInfo& ei, uint32_t dirCluster,
                                const std::string& filename, uint32_t firstCluster,
                                uint16_t modDate, uint16_t modTime, DirEntry& out) {
+    LOGI("exfat_create_file: filename=\"%s\" dirCluster=%u firstCluster=%u",
+         filename.c_str(), dirCluster, firstCluster);
+
     auto ucs2 = utf8_to_ucs2(filename);
-    if (ucs2.empty()) return false;
+    if (ucs2.empty()) {
+        LOGE("exfat_create_file: utf8_to_ucs2 returned empty for \"%s\"", filename.c_str());
+        return false;
+    }
 
     int nameEntries = (int)((ucs2.size() + 14u) / 15u);
     if (nameEntries < 1)  nameEntries = 1;
-    if (nameEntries > 17) return false; // >255 chars
+    if (nameEntries > 17) {
+        LOGE("exfat_create_file: nameEntries=%d exceeds 17 for \"%s\" (len=%zu)",
+             nameEntries, filename.c_str(), ucs2.size());
+        return false; // >255 chars
+    }
     int totalEntries = 2 + nameEntries;
 
     uint32_t ts = ((uint32_t)modDate << 16) | modTime;
@@ -1963,8 +2106,11 @@ static bool exfat_create_file(int fd, const ExFatInfo& ei, uint32_t dirCluster,
     uint64_t firstSec, lastSec;
     uint32_t firstOff, lastOff;
     if (!exfat_append_dir_entries(fd, ei, dirCluster, entries,
-                                   firstSec, firstOff, lastSec, lastOff))
+                                   firstSec, firstOff, lastSec, lastOff)) {
+        LOGE("exfat_create_file: exfat_append_dir_entries failed for \"%s\" dirCluster=%u",
+             filename.c_str(), dirCluster);
         return false;
+    }
 
     out.name         = filename;
     out.isDir        = false;
@@ -1974,6 +2120,8 @@ static bool exfat_create_file(int fd, const ExFatInfo& ei, uint32_t dirCluster,
     out.firstCluster = firstCluster;
     out.recordSector = firstSec;  // primary entry position
     out.recordOffset = firstOff;
+    LOGI("exfat_create_file: success \"%s\" at sector=%llu offset=%u",
+         filename.c_str(), (unsigned long long)firstSec, firstOff);
     return true;
 }
 
@@ -2242,6 +2390,8 @@ Java_io_veracrypt_android_corenative_NativeBridge_nativeListDir(
             return nullptr;
         }
         entries = exfat_list_cluster((int)jfd, ei, dirCluster);
+        LOGI("nativeListDir: exFAT exfat_list_cluster returned %zu entries for dirCluster=%u",
+             entries.size(), dirCluster);
 
     } else {
         env->ReleaseStringUTFChars(jpath, path);
