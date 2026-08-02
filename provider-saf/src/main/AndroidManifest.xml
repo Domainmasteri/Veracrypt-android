@@ -10,7 +10,7 @@
         <provider
             android:name=".VeraCryptDocumentsProvider"
             android:authorities="io.veracrypt.android.documents"
-            android:exported="true"
+            android:exported="false"
             android:grantUriPermissions="true"
             android:permission="android.permission.MANAGE_DOCUMENTS"
             android:enabled="true">
