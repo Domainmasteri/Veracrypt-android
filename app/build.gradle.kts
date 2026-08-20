@@ -1,19 +1,16 @@
-import java.util.Properties
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
 
-val signingProps = Properties().apply {
-    val file = rootProject.file("signing.properties")
-    if (file.exists()) {
-        file.inputStream().use(::load)
-    }
-}
-
-fun prop(name: String): String? =
-    System.getenv(name) ?: signingProps.getProperty(name)
+val keystorePath = System.getenv("VERACRYPT_KEYSTORE_PATH")
+val keystorePassword = System.getenv("VERACRYPT_KEYSTORE_PASSWORD")
+val releaseKeyAlias = System.getenv("VERACRYPT_KEY_ALIAS")
+val releaseKeyPassword = System.getenv("VERACRYPT_KEY_PASSWORD")
+val releaseSigningAvailable = !keystorePath.isNullOrBlank() &&
+    !keystorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
 
 android {
     namespace = "io.veracrypt.android"
@@ -29,10 +26,23 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            if (releaseSigningAvailable) {
+                storeFile = file(requireNotNull(keystorePath))
+                storePassword = requireNotNull(keystorePassword)
+                keyAlias = requireNotNull(releaseKeyAlias)
+                keyPassword = requireNotNull(releaseKeyPassword)
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.findByName("release") ?: signingConfig
+            if (releaseSigningAvailable) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -53,22 +63,43 @@ android {
         viewBinding = true
     }
 
-    signingConfigs {
-        create("release") {
-            val keystorePath = prop("KEYSTORE_PATH")
-            val storePass = prop("KEYSTORE_PASSWORD")
-            val keyAliasValue = prop("KEY_ALIAS")
-            val keyPass = prop("KEY_PASSWORD")
-            if (!keystorePath.isNullOrBlank() &&
-                !storePass.isNullOrBlank() &&
-                !keyAliasValue.isNullOrBlank() &&
-                !keyPass.isNullOrBlank()
-            ) {
-                storeFile = file(keystorePath)
-                storePassword = storePass
-                keyAlias = keyAliasValue
-                keyPassword = keyPass
-            }
+    sourceSets.getByName("androidTest").assets.srcDir(
+        rootProject.file("core-native/src/androidTest/assets")
+    )
+}
+
+gradle.taskGraph.whenReady {
+    val appReleaseRequested = allTasks.any { task ->
+        if (task.project != project) return@any false
+        val taskName = task.name.lowercase()
+        taskName == "assemblerelease" ||
+            taskName.startsWith("bundlerelease") ||
+            taskName.startsWith("packagerelease") ||
+            taskName.startsWith("signrelease") ||
+            taskName.startsWith("validatesigningrelease")
+    }
+    if (appReleaseRequested) {
+        val requiredVariables = mapOf(
+            "VERACRYPT_KEYSTORE_PATH" to keystorePath,
+            "VERACRYPT_KEYSTORE_PASSWORD" to keystorePassword,
+            "VERACRYPT_KEY_ALIAS" to releaseKeyAlias,
+            "VERACRYPT_KEY_PASSWORD" to releaseKeyPassword
+        )
+        val missingVariables = requiredVariables
+            .filterValues { it.isNullOrBlank() }
+            .keys
+            .sorted()
+        if (missingVariables.isNotEmpty()) {
+            throw GradleException(
+                "Release signing requires environment variables: ${missingVariables.joinToString()}"
+            )
+        }
+
+        val configuredKeystore = file(requireNotNull(keystorePath))
+        if (!configuredKeystore.isFile || !configuredKeystore.canRead()) {
+            throw GradleException(
+                "VERACRYPT_KEYSTORE_PATH must point to a readable keystore file"
+            )
         }
     }
 }

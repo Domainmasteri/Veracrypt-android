@@ -5,11 +5,11 @@ import android.content.ContentValues
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import android.util.Log
 import android.webkit.MimeTypeMap
-import io.veracrypt.android.corenative.NativeBridge
 import io.veracrypt.android.providersaf.VeraCryptDocumentsProvider
 import java.io.FileNotFoundException
 
@@ -43,61 +43,107 @@ class ContainerViewerProvider : ContentProvider() {
         val result = MatrixCursor(
             projection ?: arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
         )
-        val size = lookupEntrySize(requestedPath)
+        val session = VeraCryptDocumentsProvider.mountedSessionOrNull()
+            ?: throw FileNotFoundException("No mounted container")
+        val entry = lookupEntry(session, requestedPath)
+            ?: throw FileNotFoundException("Unknown container entry")
+        if (entry.isDirectory) throw FileNotFoundException("Entry is a directory")
         result.newRow().apply {
-            add(OpenableColumns.DISPLAY_NAME, requestedPath.substringAfterLast('/'))
-            add(OpenableColumns.SIZE, size)
+            add(OpenableColumns.DISPLAY_NAME, entry.name)
+            add(OpenableColumns.SIZE, entry.sizeBytes)
         }
         return result
     }
 
     override fun getType(uri: Uri): String {
         val requestedPath = requirePath(uri)
-        val extension = requestedPath.substringAfterLast('.', "").lowercase()
+        val session = VeraCryptDocumentsProvider.mountedSessionOrNull()
+            ?: throw FileNotFoundException("No mounted container")
+        val entry = lookupEntry(session, requestedPath)
+            ?: throw FileNotFoundException("Unknown container entry")
+        if (entry.isDirectory) throw FileNotFoundException("Entry is a directory")
+        val extension = entry.name.substringAfterLast('.', "").lowercase()
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
             ?: "application/octet-stream"
     }
 
-    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
-        if (!mode.startsWith("r")) {
+    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor =
+        openReadPipe(uri, mode, null)
+
+    override fun openFile(
+        uri: Uri,
+        mode: String,
+        signal: CancellationSignal?
+    ): ParcelFileDescriptor = openReadPipe(uri, mode, signal)
+
+    private fun openReadPipe(
+        uri: Uri,
+        mode: String,
+        signal: CancellationSignal?
+    ): ParcelFileDescriptor {
+        if (!mode.startsWith("r") || mode.contains('w') || mode.contains('+')) {
             throw UnsupportedOperationException("Read-only provider")
         }
-        val fd = VeraCryptDocumentsProvider.mountedFdOrNull()
+        val session = VeraCryptDocumentsProvider.mountedSessionOrNull()
             ?: throw IllegalStateException("No mounted container")
         val requestedPath = requirePath(uri)
+        val entry = lookupEntry(session, requestedPath)
+            ?: throw FileNotFoundException("Unknown container entry")
+        if (entry.isDirectory) throw FileNotFoundException("Entry is a directory")
         val pipes = ParcelFileDescriptor.createReliablePipe()
         val readEnd = pipes[0]
         val writeEnd = pipes[1]
-        val expectedSize = lookupEntrySize(requestedPath)
-
-        Thread {
+        val expectedSize = entry.sizeBytes
+        lateinit var thread: Thread
+        lateinit var sessionCancellation: java.io.Closeable
+        thread = Thread {
             try {
-                ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
+                val out = java.io.FileOutputStream(writeEnd.fileDescriptor)
+                try {
                     var offset = 0L
                     while (true) {
-                        val remaining = expectedSize?.minus(offset)
-                        val toRead = if (remaining != null && remaining > 0L) {
+                        if (signal?.isCanceled == true || Thread.currentThread().isInterrupted) {
+                            throw java.io.InterruptedIOException("Read cancelled")
+                        }
+                        val remaining = expectedSize.minus(offset)
+                        val toRead = if (remaining > 0L) {
                             minOf(CHUNK_SIZE.toLong(), remaining).toInt()
                         } else {
-                            CHUNK_SIZE
+                            0
                         }
                         if (toRead <= 0) break
-                        val chunk = NativeBridge.nativeReadFile(fd, requestedPath, offset, toRead)
+                        val chunk = session.read(requestedPath, offset, toRead)
                             ?: throw FileNotFoundException("Could not read $requestedPath")
                         if (chunk.isEmpty()) break
                         out.write(chunk)
                         offset += chunk.size
                         if (chunk.size < toRead) break
                     }
+                    out.flush()
+                    writeEnd.close()
+                } catch (error: Exception) {
+                    runCatching { writeEnd.closeWithError(error.message ?: "Container read failed") }
+                    throw error
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to stream $requestedPath", e)
+                Log.w(TAG, "Viewer stream ended with an error")
+            } finally {
+                signal?.setOnCancelListener(null)
+                sessionCancellation.close()
             }
         }.apply {
             isDaemon = true
             name = "viewer-${requestedPath.substringAfterLast('/')}"
-            start()
         }
+        sessionCancellation = session.onClose {
+            runCatching { writeEnd.closeWithError("Container unmounted") }
+            thread.interrupt()
+        }
+        signal?.setOnCancelListener {
+            runCatching { writeEnd.closeWithError("Read cancelled") }
+            thread.interrupt()
+        }
+        thread.start()
 
         return readEnd
     }
@@ -116,14 +162,22 @@ class ContainerViewerProvider : ContentProvider() {
     private fun requirePath(uri: Uri): String {
         val path = uri.getQueryParameter("path")
         require(!path.isNullOrBlank()) { "Missing path query parameter" }
+        require(path.startsWith('/') && !path.endsWith('/') && path.length <= 4096) {
+            "Malformed container path"
+        }
+        require(path.substring(1).split('/').none { it.isEmpty() || it == "." || it == ".." }) {
+            "Malformed container path"
+        }
         return path
     }
 
-    private fun lookupEntrySize(path: String): Long? {
-        val fd = VeraCryptDocumentsProvider.mountedFdOrNull() ?: return null
+    private fun lookupEntry(
+        session: io.veracrypt.android.corenative.ContainerSession,
+        path: String
+    ): io.veracrypt.android.coreapi.VolumeEntry? {
         val parent = parentPath(path)
-        val entries = NativeBridge.nativeListDir(fd, parent) ?: return null
-        return entries.firstOrNull { it.path == path }?.sizeBytes
+        val entries = runCatching { session.list(parent) }.getOrNull() ?: return null
+        return entries.firstOrNull { it.path == path }
     }
 
     private fun parentPath(path: String): String {

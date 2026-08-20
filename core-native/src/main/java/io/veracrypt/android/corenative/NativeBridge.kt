@@ -10,6 +10,16 @@ import io.veracrypt.android.coreapi.VolumeEntry
  */
 object NativeBridge {
 
+    const val OPEN_WRONG_PASSWORD: Long = -1L
+    const val OPEN_IO_OR_FORMAT_ERROR: Long = -2L
+    const val OPEN_CORRUPT_HEADER: Long = -3L
+    const val OPEN_UNSUPPORTED_HEADER: Long = -4L
+    const val OPEN_INVALID_FORMAT: Long = -5L
+    const val FS_UNKNOWN: Int = 0
+    const val FS_FAT32: Int = 1
+    const val FS_EXFAT: Int = 2
+    const val FS_NTFS: Int = 3
+
     init {
         System.loadLibrary("veracrypt-native")
     }
@@ -23,40 +33,52 @@ object NativeBridge {
      *
      * Reads the first 512 bytes from [fd], derives the encryption key via
      * PBKDF2-HMAC-SHA512, decrypts the header with AES-256-XTS, and – on
-     * success – stores the master keys and volume parameters in a process-wide
-     * session that subsequent calls (e.g. [nativeListDir]) reuse.
+     * success – creates an independently owned opaque session.
      *
      * @param fd       File descriptor of the opened container (read from offset 0).
      * @param password Passphrase bytes (UTF-8).
-     * @return 0 = success, -1 = wrong password, -2 = I/O or format error.
+     * @return Positive opaque handle on success, otherwise an `OPEN_*` status.
      */
     @JvmStatic
-    external fun nativeParseHeader(fd: Int, password: ByteArray): Int
+    external fun nativeOpen(fd: Int, password: ByteArray): Long
+
+    /** Close an opened session. Safe to call more than once. */
+    @JvmStatic
+    external fun nativeClose(sessionHandle: Long)
+
+    /** Returns true only while [sessionHandle] identifies an open native session. */
+    @JvmStatic
+    external fun nativeIsOpen(sessionHandle: Long): Boolean
+
+    /** Run built-in, dependency-independent cryptographic known-answer tests. */
+    @JvmStatic
+    external fun nativeRunCryptoSelfTests(): Boolean
+
+    /** Run deterministic parser boundary, Unicode and 64-bit-size self-tests. */
+    @JvmStatic
+    external fun nativeRunFilesystemSelfTests(): Boolean
 
     /**
      * List the files and sub-directories at [path] inside the currently open
      * container.
      *
-     * [nativeParseHeader] must have returned 0 before calling this function.
-     * The native side reads the FAT32 filesystem from [fd] using the master
-     * keys stored during header parsing.
+     * [nativeOpen] must have returned [sessionHandle] before this call.
      *
-     * @param fd   File descriptor of the same container that was opened with
-     *             [nativeParseHeader].
+     * @param sessionHandle Opaque positive handle returned by [nativeOpen].
      * @param path Absolute path inside the container, e.g. "/" for root.
      * @return Array of [VolumeEntry] items, or null on error / unsupported FS.
      */
     @JvmStatic
-    external fun nativeListDir(fd: Int, path: String): Array<VolumeEntry>?
+    external fun nativeListDir(sessionHandle: Long, path: String): Array<VolumeEntry>?
 
     /**
      * Read up to [length] bytes from the file at [path] inside the currently
      * open container, starting at byte [offset].
      *
-     * [nativeParseHeader] must have returned 0 before calling this function.
+     * [nativeOpen] must have returned the supplied handle before this call.
      * Data is decrypted on-the-fly with AES-256-XTS.
      *
-     * @param fd     File descriptor of the container.
+     * @param sessionHandle Opaque positive handle returned by [nativeOpen].
      * @param path   Absolute path inside the container, e.g. "/documents/report.pdf".
      * @param offset Byte offset within the file to start reading from.
      * @param length Maximum number of bytes to read (capped at 4 MiB internally).
@@ -64,66 +86,16 @@ object NativeBridge {
      *         an empty array at EOF, or null if the file is not found or on I/O error.
      */
     @JvmStatic
-    external fun nativeReadFile(fd: Int, path: String, offset: Long, length: Int): ByteArray?
-
-    /**
-     * Write [data] into an existing file [path] at [offset].
-     *
-     * Returns bytes written, or a negative status code:
-     *  -1 wrong state/arguments
-     *  -2 file not found / unsupported filesystem operation
-     *  -3 I/O error
-     */
-    @JvmStatic
-    external fun nativeWriteFile(fd: Int, path: String, offset: Long, data: ByteArray): Int
-
-    /**
-     * Allocate [count] clusters in the currently mounted filesystem.
-     *
-     * Returns first allocated cluster (>1) or a negative status code.
-     */
-    @JvmStatic
-    external fun nativeAllocateClusters(fd: Int, count: Int): Int
-
-    /**
-     * Update last-modified metadata for a root-level entry at [path].
-     *
-     * @return 0 on success, negative on error.
-     */
-    @JvmStatic
-    external fun nativeUpdateTimestamp(fd: Int, path: String, unixTimeMs: Long): Int
+    external fun nativeReadFile(
+        sessionHandle: Long,
+        path: String,
+        offset: Long,
+        length: Int
+    ): ByteArray?
 
     /** Returns 0 unknown, 1 FAT32, 2 exFAT, 3 NTFS. */
     @JvmStatic
-    external fun nativeGetFileSystemType(fd: Int): Int
-
-    /**
-     * Create a new encrypted container image.
-     *
-     * @param fd writable file descriptor.
-     * @param password passphrase bytes (UTF-8).
-     * @param entropy additional caller entropy bytes.
-     * @param containerSizeBytes output file size in bytes.
-     * @param fsType 1 FAT32, 2 exFAT, 3 NTFS.
-     * @return 0 on success, negative on error.
-     */
-    @JvmStatic
-    external fun nativeCreateContainer(
-        fd: Int,
-        password: ByteArray,
-        entropy: ByteArray,
-        containerSizeBytes: Long,
-        fsType: Int
-    ): Int
-
-    /**
-     * Root-only best-effort mount integration hook.
-     *
-     * Native side currently validates parameters and prepares mount metadata.
-     * Returns 0 when the request is accepted.
-     */
-    @JvmStatic
-    external fun nativePrepareFuseMount(fd: Int, mountPoint: String, readWrite: Boolean): Int
+    external fun nativeGetFileSystemType(sessionHandle: Long): Int
 
     /** Convenience: returns the native library version. */
     fun version(): String = nativeGetVersion()

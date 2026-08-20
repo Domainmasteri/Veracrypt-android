@@ -5,21 +5,51 @@ on:
     branches: [ "main", "feat/**", "fix/**" ]
   pull_request:
     branches: [ "main" ]
+  schedule:
+    - cron: "17 3 * * *"
 
 permissions:
   contents: read
 
 jobs:
+  security:
+    name: Dependency, license, secret and SBOM checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Review dependency and license changes
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: moderate
+          deny-licenses: AGPL-3.0, GPL-3.0
+
+      - name: Scan repository for secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: veracrypt-android.cdx.json
+          upload-artifact: true
+
   build:
     name: Build debug APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -31,20 +61,11 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Download VeraCrypt test container
+      - name: Verify committed VeraCrypt test container
         run: |
-          # The test container (AES-256-XTS, PBKDF2-HMAC-SHA512, password "test") is
-          # committed at core-native/src/androidTest/assets/test.vc.  We re-download it
-          # here from the raw GitHub URL so that the asset is guaranteed to be present
-          # even if the local checkout omits large-file assets in the future.
-          DEST=core-native/src/androidTest/assets/test.vc
-          EXPECTED_SHA256=b71651db848746d13e2b64c2f6d628b34ab74ca7f723006ef380a5e02212687a
-          mkdir -p "$(dirname "$DEST")"
-          if [ ! -f "$DEST" ]; then
-            wget -q -O "$DEST" \
-              "https://raw.githubusercontent.com/${{ github.repository }}/HEAD/core-native/src/androidTest/assets/test.vc"
-          fi
-          echo "$EXPECTED_SHA256  $DEST" | sha256sum -c -
+          echo "b030a4c46cdad4393bc6f946c594c715441c27303c2b3220374ca33648d735f1  core-native/src/androidTest/assets/test.vc" | sha256sum -c -
+          echo "cf1e00580f843269cc7480a079a43fdc23c0416741e6591c20a86b15e5de8a20  core-native/src/androidTest/assets/fat32_test.vc" | sha256sum -c -
+          echo "cc1f6a4527a465c5c7e0e6f34775ef53c92921042e2f8999a06c4a2e0cd94648  core-native/src/androidTest/assets/exfat_test.vc" | sha256sum -c -
 
       - name: Build debug APK (includes NDK/JNI compilation)
         run: ./gradlew :app:assembleDebug --stacktrace
@@ -53,43 +74,38 @@ jobs:
         run: ./gradlew :core-api:test :app:testDebugUnitTest --stacktrace
 
       - name: Upload debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: veracrypt-android-debug
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 14
 
   instrumented-tests:
-    name: Instrumented tests (AES-XTS header parsing)
+    name: Instrumented crypto, filesystem and SAF tests
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Download VeraCrypt test container
+      - name: Verify committed VeraCrypt test container
         run: |
-          DEST=core-native/src/androidTest/assets/test.vc
-          EXPECTED_SHA256=b71651db848746d13e2b64c2f6d628b34ab74ca7f723006ef380a5e02212687a
-          mkdir -p "$(dirname "$DEST")"
-          if [ ! -f "$DEST" ]; then
-            wget -q -O "$DEST" \
-              "https://raw.githubusercontent.com/${{ github.repository }}/HEAD/core-native/src/androidTest/assets/test.vc"
-          fi
-          echo "$EXPECTED_SHA256  $DEST" | sha256sum -c -
+          echo "b030a4c46cdad4393bc6f946c594c715441c27303c2b3220374ca33648d735f1  core-native/src/androidTest/assets/test.vc" | sha256sum -c -
+          echo "cf1e00580f843269cc7480a079a43fdc23c0416741e6591c20a86b15e5de8a20  core-native/src/androidTest/assets/fat32_test.vc" | sha256sum -c -
+          echo "cc1f6a4527a465c5c7e0e6f34775ef53c92921042e2f8999a06c4a2e0cd94648  core-native/src/androidTest/assets/exfat_test.vc" | sha256sum -c -
 
       - name: Enable KVM for hardware acceleration
         run: |
@@ -99,58 +115,96 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Run instrumented tests on Android emulator
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@0a638108440efd5c7f980e6ba145dbcdd8f32009 # v2.37.0
         with:
           api-level: 29
           arch: x86_64
           profile: Nexus 6
-          script: ./gradlew :core-native:connectedAndroidTest --stacktrace
+          script: ./gradlew :core-native:connectedAndroidTest :app:connectedDebugAndroidTest --stacktrace
 
   release-apk:
     name: Build signed release APK
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push'
 
     env:
-      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      VERACRYPT_KEYSTORE_BASE64: ${{ secrets.VERACRYPT_KEYSTORE_BASE64 }}
+      VERACRYPT_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+      VERACRYPT_KEYSTORE_PASSWORD: ${{ secrets.VERACRYPT_KEYSTORE_PASSWORD }}
+      VERACRYPT_KEY_ALIAS: ${{ secrets.VERACRYPT_KEY_ALIAS }}
+      VERACRYPT_KEY_PASSWORD: ${{ secrets.VERACRYPT_KEY_PASSWORD }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Decode keystore from GitHub Secrets
         run: |
-          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
-            echo "Signing secrets are missing. Skipping release build."
-            exit 0
+          if [ -z "$VERACRYPT_KEYSTORE_BASE64" ] || [ -z "$VERACRYPT_KEY_ALIAS" ] || [ -z "$VERACRYPT_KEY_PASSWORD" ] || [ -z "$VERACRYPT_KEYSTORE_PASSWORD" ]; then
+            echo "Required VeraCrypt release-signing secrets are missing."
+            exit 1
           fi
-          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
-          echo "KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          printf '%s' "$VERACRYPT_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
 
       - name: Build release APK
-        if: env.KEYSTORE_PATH != ''
         run: ./gradlew :app:assembleRelease --stacktrace
 
+      - name: Verify release signature
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk
+
+      - name: Record release checksum
+        run: sha256sum app/build/outputs/apk/release/app-release.apk > app/build/outputs/apk/release/app-release.apk.sha256
+
       - name: Upload release APK
-        if: env.KEYSTORE_PATH != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: veracrypt-android-release
-          path: app/build/outputs/apk/release/*.apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/*.sha256
           retention-days: 14
+
+  sanitizer-build:
+    name: Nightly native ASan/UBSan and filesystem fuzzing
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+      - name: Build native code with ASan and UBSan
+        run: ./gradlew :core-native:assembleDebug -PveracryptSanitizers=true --stacktrace
+      - name: Configure host filesystem fuzzers
+        run: cmake -S core-native/fuzz -B build/fuzz -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build host filesystem fuzzers
+        run: cmake --build build/fuzz --parallel
+      - name: Run filesystem validation regressions under ASan and UBSan
+        run: ctest --test-dir build/fuzz --output-on-failure
+      - name: Fuzz BPB validation with ASan and UBSan
+        run: build/fuzz/bpb_fuzzer -max_total_time=60 -max_len=4096 -dict=core-native/fuzz/bpb.dict
+      - name: Fuzz FAT chain validation with ASan and UBSan
+        run: build/fuzz/fat_fuzzer -max_total_time=60 -max_len=4096
+      - name: Fuzz directory entry validation with ASan and UBSan
+        run: build/fuzz/directory_fuzzer -max_total_time=60 -max_len=4096 -dict=core-native/fuzz/directory.dict

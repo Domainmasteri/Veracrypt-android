@@ -5,10 +5,10 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
-import android.provider.OpenableColumns
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.MimeTypeMap
 import android.widget.BaseAdapter
 import android.widget.ImageView
@@ -19,7 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import io.veracrypt.android.coreapi.VolumeEntry
-import io.veracrypt.android.corenative.NativeBridge
+import io.veracrypt.android.corenative.ContainerSession
 import io.veracrypt.android.databinding.ActivityFileExplorerBinding
 import io.veracrypt.android.databinding.ItemExplorerEntryBinding
 import io.veracrypt.android.providersaf.VeraCryptDocumentsProvider
@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 private const val KEY_PENDING_EXPORT_PATH = "pending_export_folder_path"
+private const val KEY_CURRENT_PATH = "current_path"
 
 class FileExplorerActivity : AppCompatActivity() {
 
@@ -39,16 +40,6 @@ class FileExplorerActivity : AppCompatActivity() {
 
     /** Holds the container path of the folder to be exported, across configuration changes. */
     private var pendingExportFolderPath: String? = null
-
-    private val importDocumentLauncher =
-        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri != null) importFileFromUri(uri)
-        }
-
-    private val importFolderLauncher =
-        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-            if (uri != null) importFolderFromUri(uri)
-        }
 
     private val exportFolderLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -61,13 +52,13 @@ class FileExplorerActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         binding = ActivityFileExplorerBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
         binding.listEntries.adapter = adapter
         binding.listEntries.emptyView = binding.tvEmpty
         binding.btnUp.setOnClickListener { navigateUp() }
-        binding.fabImport.setOnClickListener { showImportMenu() }
         binding.listEntries.setOnItemClickListener { _, _, position, _ ->
             val entry = adapter.getItem(position)
             if (entry.isDirectory) {
@@ -94,11 +85,12 @@ class FileExplorerActivity : AppCompatActivity() {
             finish()
             return
         }
-        loadPath("/")
+        loadPath(savedInstanceState?.getString(KEY_CURRENT_PATH) ?: "/")
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
+        outState.putString(KEY_CURRENT_PATH, currentPath)
         pendingExportFolderPath?.let { outState.putString(KEY_PENDING_EXPORT_PATH, it) }
     }
 
@@ -121,7 +113,7 @@ class FileExplorerActivity : AppCompatActivity() {
     }
 
     private fun loadPath(path: String) {
-        val fd = VeraCryptDocumentsProvider.mountedFdOrNull() ?: run {
+        val session = VeraCryptDocumentsProvider.mountedSessionOrNull() ?: run {
             finish()
             return
         }
@@ -130,7 +122,7 @@ class FileExplorerActivity : AppCompatActivity() {
         binding.btnUp.isEnabled = path != "/"
         worker.execute {
             try {
-                val listed = NativeBridge.nativeListDir(fd, path)
+                val listed = session.list(path)
                     ?.sortedWith(compareBy<VolumeEntry> { !it.isDirectory }.thenBy { it.name.lowercase() })
                     ?: throw IllegalStateException("nativeListDir returned null for $path")
 
@@ -152,194 +144,21 @@ class FileExplorerActivity : AppCompatActivity() {
         }
     }
 
-    private fun showImportMenu() {
-        AlertDialog.Builder(this)
-            .setItems(
-                arrayOf(
-                    getString(R.string.explorer_import_file),
-                    getString(R.string.explorer_import_folder)
-                )
-            ) { _, which ->
-                when (which) {
-                    0 -> importDocumentLauncher.launch(arrayOf("*/*"))
-                    1 -> importFolderLauncher.launch(null)
-                }
-            }
-            .show()
-    }
-
     private fun showFolderOptions(entry: VolumeEntry) {
         AlertDialog.Builder(this)
             .setTitle(entry.name)
             .setItems(arrayOf(getString(R.string.explorer_export_folder))) { _, _ ->
-                pendingExportFolderPath = entry.path
-                exportFolderLauncher.launch(null)
+                AlertDialog.Builder(this)
+                    .setTitle(R.string.export_plaintext_title)
+                    .setMessage(R.string.export_plaintext_warning)
+                    .setPositiveButton(R.string.export_plaintext_continue) { _, _ ->
+                        pendingExportFolderPath = entry.path
+                        exportFolderLauncher.launch(null)
+                    }
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show()
             }
             .show()
-    }
-
-    private fun importFileFromUri(uri: Uri) {
-        val fd = VeraCryptDocumentsProvider.mountedFdOrNull() ?: run {
-            finish()
-            return
-        }
-        val fileName = resolveImportName(uri)
-        val destinationPath = joinPath(currentPath, fileName)
-
-        binding.progress.visibility = View.VISIBLE
-        Toast.makeText(this, getString(R.string.explorer_importing), Toast.LENGTH_SHORT).show()
-
-        worker.execute {
-            try {
-                contentResolver.openInputStream(uri)?.use { input ->
-                    val buffer = ByteArray(65536)
-                    var offset = 0L
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
-                        val written = NativeBridge.nativeWriteFile(fd, destinationPath, offset, chunk)
-                        if (written <= 0) {
-                            throw IOException("nativeWriteFile failed ($written) for $destinationPath")
-                        }
-                        offset += written
-                    }
-                } ?: throw IOException("Unable to open input stream for $uri")
-
-                runOnUiThread {
-                    binding.progress.visibility = View.GONE
-                    Toast.makeText(
-                        this,
-                        getString(R.string.explorer_import_done, fileName),
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    loadPath(currentPath)
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    binding.progress.visibility = View.GONE
-                    Toast.makeText(
-                        this,
-                        e.message ?: e.toString(),
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        }
-    }
-
-    private fun resolveImportName(uri: Uri): String {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (index >= 0 && cursor.moveToFirst()) {
-                val name = cursor.getString(index)
-                if (!name.isNullOrBlank()) return name
-            }
-        }
-        return uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
-            ?: "imported_file"
-    }
-
-    /**
-     * Import all files from [treeUri] (recursively) into [currentPath] inside the container.
-     * Directory structure from the source is flattened – all files are placed directly in
-     * [currentPath]. Files with the same name overwrite each other.
-     */
-    private fun importFolderFromUri(treeUri: Uri) {
-        val fd = VeraCryptDocumentsProvider.mountedFdOrNull() ?: run {
-            finish()
-            return
-        }
-
-        binding.progress.visibility = View.VISIBLE
-        Toast.makeText(this, getString(R.string.explorer_importing_folder), Toast.LENGTH_SHORT).show()
-
-        worker.execute {
-            val counts = IntArray(2) // [0] = imported, [1] = failed
-            try {
-                val files = collectDocumentTreeFiles(treeUri)
-                for ((displayName, fileUri) in files) {
-                    val destinationPath = joinPath(currentPath, displayName)
-                    try {
-                        contentResolver.openInputStream(fileUri)?.use { input ->
-                            val buffer = ByteArray(65536)
-                            var offset = 0L
-                            while (true) {
-                                val read = input.read(buffer)
-                                if (read <= 0) break
-                                val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
-                                val written = NativeBridge.nativeWriteFile(fd, destinationPath, offset, chunk)
-                                if (written <= 0) throw IOException("nativeWriteFile failed ($written)")
-                                offset += written
-                            }
-                        } ?: throw IOException("Unable to open input stream for $fileUri")
-                        counts[0]++
-                    } catch (_: Exception) {
-                        counts[1]++
-                    }
-                }
-
-                runOnUiThread {
-                    binding.progress.visibility = View.GONE
-                    val msg = if (counts[1] == 0) {
-                        getString(R.string.explorer_import_folder_done, counts[0])
-                    } else {
-                        getString(R.string.explorer_import_folder_partial, counts[0], counts[1])
-                    }
-                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-                    loadPath(currentPath)
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    binding.progress.visibility = View.GONE
-                    Toast.makeText(this, e.message ?: e.toString(), Toast.LENGTH_LONG).show()
-                }
-            }
-        }
-    }
-
-    /**
-     * Recursively collect all file (non-directory) entries from a document tree.
-     * Returns a list of (displayName, fileUri) pairs. Directory structure is flattened –
-     * only the immediate file name is returned as the display name.
-     */
-    private fun collectDocumentTreeFiles(treeUri: Uri): List<Pair<String, Uri>> {
-        val result = mutableListOf<Pair<String, Uri>>()
-        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
-        collectFromDocumentChildren(treeUri, rootDocId, result)
-        return result
-    }
-
-    private fun collectFromDocumentChildren(
-        treeUri: Uri,
-        parentDocId: String,
-        result: MutableList<Pair<String, Uri>>
-    ) {
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
-        contentResolver.query(
-            childrenUri,
-            arrayOf(
-                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                DocumentsContract.Document.COLUMN_MIME_TYPE
-            ),
-            null, null, null
-        )?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-            while (cursor.moveToNext()) {
-                val docId = cursor.getString(idCol) ?: continue
-                val name = cursor.getString(nameCol) ?: continue
-                val mime = cursor.getString(mimeCol) ?: continue
-                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                    collectFromDocumentChildren(treeUri, docId, result)
-                } else {
-                    val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-                    result.add(Pair(name, fileUri))
-                }
-            }
-        }
     }
 
     /**
@@ -347,7 +166,7 @@ class FileExplorerActivity : AppCompatActivity() {
      * preserving the directory structure inside the destination.
      */
     private fun exportFolderToUri(containerFolderPath: String, destTreeUri: Uri) {
-        val fd = VeraCryptDocumentsProvider.mountedFdOrNull() ?: run {
+        val session = VeraCryptDocumentsProvider.mountedSessionOrNull() ?: run {
             finish()
             return
         }
@@ -360,7 +179,7 @@ class FileExplorerActivity : AppCompatActivity() {
             try {
                 val rootDocId = DocumentsContract.getTreeDocumentId(destTreeUri)
                 val rootDestUri = DocumentsContract.buildDocumentUriUsingTree(destTreeUri, rootDocId)
-                exportContainerDirectory(fd, containerFolderPath, rootDestUri, counts)
+                exportContainerDirectory(session, containerFolderPath, rootDestUri, counts)
 
                 runOnUiThread {
                     binding.progress.visibility = View.GONE
@@ -385,12 +204,12 @@ class FileExplorerActivity : AppCompatActivity() {
      * recreating the directory hierarchy via [DocumentsContract.createDocument].
      */
     private fun exportContainerDirectory(
-        fd: Int,
+        session: ContainerSession,
         containerPath: String,
         destDirUri: Uri,
         counts: IntArray
     ) {
-        val entries = NativeBridge.nativeListDir(fd, containerPath) ?: return
+        val entries = session.list(containerPath) ?: return
         for (entry in entries) {
             if (entry.isDirectory) {
                 val subDirUri = try {
@@ -403,7 +222,7 @@ class FileExplorerActivity : AppCompatActivity() {
                 } catch (_: Exception) {
                     null
                 } ?: continue
-                exportContainerDirectory(fd, entry.path, subDirUri, counts)
+                exportContainerDirectory(session, entry.path, subDirUri, counts)
             } else {
                 try {
                     val mime = resolveMime(entry.path)
@@ -419,7 +238,7 @@ class FileExplorerActivity : AppCompatActivity() {
                         var offset = 0L
                         while (offset < entry.sizeBytes) {
                             val toRead = (entry.sizeBytes - offset).coerceAtMost(chunkSize.toLong()).toInt()
-                            val chunk = NativeBridge.nativeReadFile(fd, entry.path, offset, toRead)
+                            val chunk = session.read(entry.path, offset, toRead)
                                 ?: throw IOException("nativeReadFile returned null for ${entry.path}")
                             if (chunk.isEmpty()) break
                             output.write(chunk)
@@ -433,13 +252,6 @@ class FileExplorerActivity : AppCompatActivity() {
             }
         }
     }
-
-
-    private fun joinPath(base: String, name: String): String {
-        val cleanName = name.substringAfterLast('/').ifBlank { "imported_file" }
-        return if (base == "/") "/$cleanName" else "${base.trimEnd('/')}/$cleanName"
-    }
-
     private fun openFile(entry: VolumeEntry) {
         val mime = resolveMime(entry.path)
         val isSupported = mime == "application/pdf" || mime.startsWith("image/") || mime.startsWith("text/")
@@ -448,6 +260,17 @@ class FileExplorerActivity : AppCompatActivity() {
             return
         }
 
+        AlertDialog.Builder(this)
+            .setTitle(R.string.preview_plaintext_title)
+            .setMessage(R.string.preview_plaintext_warning)
+            .setPositiveButton(R.string.preview_plaintext_continue) { _, _ ->
+                launchExternalPreview(entry, mime)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun launchExternalPreview(entry: VolumeEntry, mime: String) {
         val uri: Uri = ContainerViewerProvider.buildUri(entry.path)
         val intent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(uri, mime)

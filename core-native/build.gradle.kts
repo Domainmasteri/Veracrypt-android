@@ -3,6 +3,10 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+val nativeSanitizersEnabled = providers.gradleProperty("veracryptSanitizers")
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
+
 android {
     namespace = "io.veracrypt.android.corenative"
     compileSdk = 35
@@ -19,7 +23,10 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++17", "-Wall")
-                arguments += listOf("-DANDROID_STL=c++_shared")
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared",
+                    "-DVERACRYPT_ENABLE_SANITIZERS=${if (nativeSanitizersEnabled.get()) "ON" else "OFF"}"
+                )
             }
         }
     }

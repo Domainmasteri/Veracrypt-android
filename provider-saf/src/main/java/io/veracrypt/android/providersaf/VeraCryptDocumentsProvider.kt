@@ -8,24 +8,27 @@ import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
 import android.util.Log
+import android.webkit.MimeTypeMap
 import io.veracrypt.android.coreapi.VolumeEntry
-import io.veracrypt.android.corenative.NativeBridge
+import io.veracrypt.android.corenative.ContainerSession
+import io.veracrypt.android.corenative.ContainerSessionManager
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "VeraCryptDocsProvider"
 
 /**
  * Storage Access Framework [DocumentsProvider] for VeraCrypt containers.
  *
- * This provider exposes the (read-only) file system inside an opened VeraCrypt
- * container to any Android picker or file-manager that speaks the SAF protocol.
+ * This provider exposes the read-only root directory of an opened VeraCrypt
+ * container to Android clients that speak the SAF protocol.
  *
  * ## Lifecycle
- * 1. The host app opens a container via [NativeBridge.nativeParseHeader].
- * 2. It calls [mount] to register the open [ParcelFileDescriptor] with this provider.
+ * 1. The host app opens a container through the native session manager.
+ * 2. It calls [mount] to activate the opaque session for this provider.
  * 3. Android's document picker discovers the root via [queryRoots].
- * 4. Directory listings flow through [queryChildDocuments] via [NativeBridge.nativeListDir].
- * 5. The host app calls [unmount] when the user closes the container, which closes the fd.
+ * 4. Directory listings flow through [queryChildDocuments] via [ContainerSession].
+ * 5. [unmount] closes the session after already accepted operations complete.
  */
 class VeraCryptDocumentsProvider : DocumentsProvider() {
 
@@ -55,42 +58,20 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
         /** Synthetic document ID representing the root of the container file system. */
         private const val ROOT_DOCUMENT_ID = "/"
-        private const val FS_FAT32 = 1
-        private const val FS_EXFAT = 2
-
-        /** The open [ParcelFileDescriptor] passed to [mount].  Owned by this provider. */
-        @Volatile
-        private var mountedPfd: ParcelFileDescriptor? = null
-
-        /**
-         * Raw int file descriptor extracted from [mountedPfd].
-         * -1 when no container is mounted.
-         */
-        @Volatile
-        private var mountedFd: Int = -1
+        private const val STREAM_CHUNK_SIZE = 64 * 1024
+        private data class ActiveStream(
+            val writeEnd: ParcelFileDescriptor,
+            val thread: Thread
+        )
+        private val activeStreams = ConcurrentHashMap<Long, ActiveStream>()
+        private val nextStreamId = AtomicLong(1L)
 
         /**
-         * Cache of [VolumeEntry] objects by document-path, populated lazily by
-         * [queryChildDocuments] and consumed by [queryDocument].
+         * Register a successfully opened native session with this provider.
          */
-        private val entryCache = ConcurrentHashMap<String, VolumeEntry>()
-
-        /**
-         * Register a successfully opened container with this provider.
-         *
-         * The provider takes **ownership** of [pfd] and will close it in [unmount].
-         * The caller must not close [pfd] after calling this function.
-         *
-         * @param pfd Open, readable [ParcelFileDescriptor] of the VeraCrypt container.
-         *            [NativeBridge.nativeParseHeader] must have returned 0 for this fd.
-         */
-        fun mount(pfd: ParcelFileDescriptor) {
-            // Close any previously mounted container before mounting the new one
-            try { mountedPfd?.close() } catch (_: Exception) {}
-            mountedPfd = pfd
-            mountedFd  = pfd.fd
-            entryCache.clear()
-            Log.i(TAG, "Container mounted fd=${pfd.fd}")
+        fun mount(session: ContainerSession) {
+            ContainerSessionManager.activate(session)
+            Log.i(TAG, "Container session mounted")
         }
 
         /**
@@ -98,18 +79,20 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
          * Safe to call even when no container is mounted.
          */
         fun unmount() {
-            try { mountedPfd?.close() } catch (_: Exception) {}
-            mountedPfd = null
-            mountedFd  = -1
-            entryCache.clear()
+            activeStreams.values.forEach { stream ->
+                runCatching { stream.writeEnd.closeWithError("Container unmounted") }
+                stream.thread.interrupt()
+            }
+            activeStreams.clear()
+            ContainerSessionManager.unmount()
             Log.i(TAG, "Container unmounted")
         }
 
         /** Returns true when a container is currently mounted. */
-        fun isMounted(): Boolean = mountedFd >= 0
+        fun isMounted(): Boolean = ContainerSessionManager.currentOrNull() != null
 
-        /** Returns the active mounted container fd or null when unmounted. */
-        fun mountedFdOrNull(): Int? = mountedFd.takeIf { it >= 0 }
+        /** Returns a stable snapshot of the active session, or null when unmounted. */
+        fun mountedSessionOrNull(): ContainerSession? = ContainerSessionManager.currentOrNull()
     }
 
     override fun onCreate(): Boolean {
@@ -119,7 +102,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
-        if (mountedFd < 0) return result
+        if (!isMounted()) return result
 
         result.newRow().apply {
             add(Root.COLUMN_ROOT_ID,      "veracrypt-root")
@@ -135,11 +118,15 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
-        val cached = entryCache[documentId]
-        if (cached != null) {
-            addEntryRow(result, cached)
+        val normalizedId = normalizeDocumentId(documentId)
+        val session = mountedSessionOrNull()
+            ?: throw java.io.FileNotFoundException("The mounted container session has expired")
+        if (normalizedId == ROOT_DOCUMENT_ID) {
+            addDocumentRow(result, normalizedId)
         } else {
-            addDocumentRow(result, documentId)
+            val entry = lookupEntry(session, normalizedId)
+                ?: throw java.io.FileNotFoundException("Unknown document")
+            addEntryRow(result, entry)
         }
         return result
     }
@@ -150,31 +137,18 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         sortOrder: String?
     ): Cursor {
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
-        val fd = mountedFd
-        if (fd < 0) return result
-        val writableFs = supportsWrite(fd)
-
-        try {
-            val entries = NativeBridge.nativeListDir(fd, parentDocumentId) ?: return result
-            for (entry in entries) {
-                entryCache[entry.path] = entry
-                result.newRow().apply {
-                    add(Document.COLUMN_DOCUMENT_ID,   entry.path)
-                    add(Document.COLUMN_MIME_TYPE,
-                        if (entry.isDirectory) Document.MIME_TYPE_DIR else MIME_TYPE_VERACRYPT)
-                    add(Document.COLUMN_DISPLAY_NAME,  entry.name)
-                    add(Document.COLUMN_LAST_MODIFIED, entry.lastModifiedMs.takeIf { it > 0L })
-                    add(
-                        Document.COLUMN_FLAGS,
-                        if (entry.isDirectory || !writableFs) 0 else
-                            Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE
-                    )
-                    add(Document.COLUMN_SIZE,
-                        if (entry.isDirectory) null else entry.sizeBytes)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error listing children of $parentDocumentId", e)
+        val session = mountedSessionOrNull()
+            ?: throw java.io.FileNotFoundException("The mounted container session has expired")
+        val normalizedParent = normalizeDocumentId(parentDocumentId)
+        if (normalizedParent != ROOT_DOCUMENT_ID) {
+            val parent = lookupEntry(session, normalizedParent)
+                ?: throw java.io.FileNotFoundException("Unknown parent document")
+            if (!parent.isDirectory) throw java.io.FileNotFoundException("Parent is not a directory")
+        }
+        val entries = runCatching { session.list(normalizedParent) }.getOrNull()
+            ?: throw java.io.FileNotFoundException("Directory could not be read")
+        for (entry in entries) {
+            addEntryRow(result, entry)
         }
 
         return result
@@ -185,79 +159,79 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         mode: String,
         signal: CancellationSignal?
     ): ParcelFileDescriptor {
-        val fd = mountedFd
-        if (fd < 0) {
+        val session = mountedSessionOrNull()
+        if (session == null) {
             throw IllegalStateException("No VeraCrypt container is currently mounted")
         }
 
         // Use the cached file size when available so we can terminate the loop exactly.
-        val fileSize = entryCache[documentId]?.sizeBytes ?: -1L
+        val normalizedId = normalizeDocumentId(documentId)
+        val entry = lookupEntry(session, normalizedId)
+            ?: throw java.io.FileNotFoundException("Unknown document")
+        if (entry.isDirectory) {
+            throw UnsupportedOperationException("Directories cannot be opened as files")
+        }
+        val fileSize = entry.sizeBytes
 
-        val writable = mode.contains("w")
-        if (writable && !supportsWrite(fd)) {
-            throw UnsupportedOperationException("Write is not supported for this filesystem")
+        if (!mode.startsWith("r") || mode.contains("w") || mode.contains("+")) {
+            throw UnsupportedOperationException("Write is not supported")
         }
-        val pipes = if (writable) {
-            ParcelFileDescriptor.createPipe()
-        } else {
-            ParcelFileDescriptor.createReliablePipe()
-        }
+        val pipes = ParcelFileDescriptor.createReliablePipe()
         val readEnd   = pipes[0]
         val writeEnd  = pipes[1]
 
-        val thread = Thread {
+        val streamId = nextStreamId.getAndIncrement()
+        lateinit var thread: Thread
+        lateinit var sessionCancellation: java.io.Closeable
+        thread = Thread {
             try {
-                if (writable) {
-                    ParcelFileDescriptor.AutoCloseInputStream(readEnd).use { input ->
-                        val chunk = ByteArray(65536)
-                        var offset = 0L
-                        while (true) {
-                            if (signal?.isCanceled == true) break
-                            val n = input.read(chunk)
-                            if (n <= 0) break
-                            val toWrite = if (n == chunk.size) chunk else chunk.copyOf(n)
-                            val written = NativeBridge.nativeWriteFile(fd, documentId, offset, toWrite)
-                            if (written <= 0) break
-                            offset += written
+                val out = java.io.FileOutputStream(writeEnd.fileDescriptor)
+                try {
+                    var offset = 0L
+                    while (true) {
+                        if (signal?.isCanceled == true || Thread.currentThread().isInterrupted) {
+                            throw java.io.InterruptedIOException("Read cancelled")
                         }
+
+                        val toRead = minOf(STREAM_CHUNK_SIZE.toLong(), fileSize - offset).toInt()
+                        if (toRead <= 0) break
+
+                        val chunk = session.read(normalizedId, offset, toRead)
+                            ?: throw java.io.IOException("Container read failed")
+                        if (chunk.isEmpty()) break
+
+                        out.write(chunk)
+                        offset += chunk.size
+
+                        if (chunk.size < toRead) break // native signalled EOF
                     }
-                    if (fileSize >= 0L) {
-                        NativeBridge.nativeUpdateTimestamp(fd, documentId, System.currentTimeMillis())
-                    }
-                } else {
-                    ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
-                        val chunkSize = 65536 // 64 KiB per native call
-                        var offset = 0L
-                        while (true) {
-                            if (signal?.isCanceled == true) break
-
-                            val toRead: Int = if (fileSize > 0L) {
-                                minOf(chunkSize.toLong(), fileSize - offset).toInt()
-                            } else {
-                                chunkSize
-                            }
-                            if (toRead <= 0) break
-
-                            val chunk = NativeBridge.nativeReadFile(fd, documentId, offset, toRead)
-                            if (chunk == null || chunk.isEmpty()) break
-
-                            out.write(chunk)
-                            offset += chunk.size
-
-                            if (chunk.size < toRead) break // native signalled EOF
-                        }
-                    }
+                    out.flush()
+                    writeEnd.close()
+                } catch (error: Exception) {
+                    runCatching { writeEnd.closeWithError(error.message ?: "Container read failed") }
+                    throw error
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "openDocument: error streaming $documentId", e)
-                // writeEnd is closed by AutoCloseOutputStream.use{}
+                Log.w(TAG, "Document stream ended with an error")
+            } finally {
+                activeStreams.remove(streamId)
+                sessionCancellation.close()
             }
         }
         thread.isDaemon = true
-        thread.name = "veracrypt-read-${documentId.substringAfterLast('/')}"
+        thread.name = "veracrypt-document-stream"
+        sessionCancellation = session.onClose {
+            runCatching { writeEnd.closeWithError("Container unmounted") }
+            thread.interrupt()
+        }
+        activeStreams[streamId] = ActiveStream(writeEnd, thread)
+        signal?.setOnCancelListener {
+            runCatching { writeEnd.closeWithError("Read cancelled") }
+            thread.interrupt()
+        }
         thread.start()
 
-        return if (writable) writeEnd else readEnd
+        return readEnd
     }
 
     // -------------------------------------------------------------------------
@@ -266,17 +240,15 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
     /** Add a row built from a cached [VolumeEntry]. */
     private fun addEntryRow(cursor: MatrixCursor, entry: VolumeEntry) {
-        val writableFs = mountedFd >= 0 && supportsWrite(mountedFd)
         cursor.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID,   entry.path)
             add(Document.COLUMN_MIME_TYPE,
-                if (entry.isDirectory) Document.MIME_TYPE_DIR else MIME_TYPE_VERACRYPT)
+                if (entry.isDirectory) Document.MIME_TYPE_DIR else mimeTypeFor(entry.name))
             add(Document.COLUMN_DISPLAY_NAME,  entry.name)
             add(Document.COLUMN_LAST_MODIFIED, entry.lastModifiedMs.takeIf { it > 0L })
             add(
                 Document.COLUMN_FLAGS,
-                if (entry.isDirectory || !writableFs) 0 else
-                    Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE
+                0
             )
             add(Document.COLUMN_SIZE,
                 if (entry.isDirectory) null else entry.sizeBytes)
@@ -298,10 +270,30 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         }
     }
 
-    private fun supportsWrite(fd: Int): Boolean {
-        return when (NativeBridge.nativeGetFileSystemType(fd)) {
-            FS_FAT32, FS_EXFAT -> true
-            else -> false
-        }
+    private fun lookupEntry(session: ContainerSession, documentId: String): VolumeEntry? {
+        if (documentId == ROOT_DOCUMENT_ID) return null
+        val parent = documentId.substringBeforeLast('/', "").ifEmpty { "/" }
+        return runCatching { session.list(parent) }.getOrNull()
+            ?.firstOrNull { it.path == documentId }
     }
+
+    private fun normalizeDocumentId(documentId: String): String {
+        if (documentId == ROOT_DOCUMENT_ID) return documentId
+        if (!documentId.startsWith('/') || documentId.endsWith('/') ||
+            documentId.length > 4096) {
+            throw java.io.FileNotFoundException("Malformed document ID")
+        }
+        val parts = documentId.substring(1).split('/')
+        if (parts.any { it.isEmpty() || it == "." || it == ".." }) {
+            throw java.io.FileNotFoundException("Malformed document ID")
+        }
+        return "/" + parts.joinToString("/")
+    }
+
+    private fun mimeTypeFor(name: String): String {
+        val extension = name.substringAfterLast('.', "").lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+            ?: MIME_TYPE_VERACRYPT
+    }
+
 }
